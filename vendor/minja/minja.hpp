@@ -175,7 +175,7 @@ public:
     }
   }
 
-  std::vector<Value> keys() {
+  std::vector<Value> keys() const {
     if (!object_) throw std::runtime_error("Value is not an object: " + dump());
     std::vector<Value> res;
     for (const auto& item : *object_) {
@@ -2736,8 +2736,65 @@ inline std::shared_ptr<Context> Context::builtins() {
   globals.set("raise_exception", simple_function("raise_exception", { "message" }, [](const std::shared_ptr<Context> &, Value & args) -> Value {
     throw std::runtime_error(args.at("message").get<std::string>());
   }));
-  globals.set("tojson", simple_function("tojson", { "value", "indent", "ensure_ascii" }, [](const std::shared_ptr<Context> &, Value & args) {
-    return Value(args.at("value").dump(args.get<int64_t>("indent", -1), /* to_json= */ true));
+  globals.set("tojson", simple_function("tojson", { "value", "indent", "separators", "ensure_ascii" }, [](const std::shared_ptr<Context> &, Value & args) {
+    // Recursive helper to convert Value to nlohmann::json
+    std::function<nlohmann::json(const Value &)> value_to_json = [&](const Value & v) -> nlohmann::json {
+      if (v.is_object()) {
+        nlohmann::json j = nlohmann::json::object();
+        for (const auto& key : v.keys()) {
+          j[key.get<std::string>()] = value_to_json(v.at(key));
+        }
+        return j;
+      } else if (v.is_array()) {
+        nlohmann::json j = nlohmann::json::array();
+        for (size_t i = 0; i < v.size(); ++i) {
+          j.push_back(value_to_json(v.at(i)));
+        }
+        return j;
+      } else if (v.is_string()) {
+        return v.get<std::string>();
+      } else if (v.is_number_integer()) {
+        return v.get<int64_t>();
+      } else if (v.is_number_float()) {
+        return v.get<double>();
+      } else if (v.is_boolean()) {
+        return v.get<bool>();
+      } else {
+        return nullptr;
+      }
+    };
+
+    try {
+      int64_t indent = args.get<int64_t>("indent", -1);
+      bool ensure_ascii = args.get<bool>("ensure_ascii", false);
+
+      nlohmann::json j = value_to_json(args.at("value"));
+
+      if (args.contains("separators") && args.at("separators").is_array()) {
+        auto sep = args.at("separators");
+        if (sep.size() == 2) {
+          std::string item_sep = sep.at(0).get<std::string>();
+          std::string key_sep = sep.at(1).get<std::string>();
+          std::string json_str = j.dump(indent, ' ', ensure_ascii);
+          if (indent == -1) {
+            size_t pos = 0;
+            while ((pos = json_str.find(", ", pos)) != std::string::npos) {
+              json_str.replace(pos, 2, item_sep);
+              pos += item_sep.length();
+            }
+            pos = 0;
+            while ((pos = json_str.find(": ", pos)) != std::string::npos) {
+              json_str.replace(pos, 2, key_sep);
+              pos += key_sep.length();
+            }
+          }
+          return Value(json_str);
+        }
+      }
+      return Value(j.dump(indent, ' ', ensure_ascii));
+    } catch (const std::exception & e) {
+      throw std::runtime_error(std::string("tojson: ") + e.what());
+    }
   }));
   globals.set("items", simple_function("items", { "object" }, [](const std::shared_ptr<Context> &, Value & args) {
     auto items = Value::array();
