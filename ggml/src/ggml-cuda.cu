@@ -1412,8 +1412,18 @@ GGML_CALL static const char * ggml_backend_cuda_host_buffer_name(ggml_backend_bu
 }
 
 #ifdef __linux__
+
+// Maximum size of a single cudaHostRegister() call.
+// Very large single registrations (e.g. >500 GiB) can fail with cudaErrorMemoryAllocation
+// even when enough host memory is available, so we register the mmap'd region in chunks.
+static constexpr size_t ggml_cuda_host_register_chunk_size = 64ULL * 1024 * 1024 * 1024; // 64 GiB
+
 GGML_CALL static void ggml_backend_cuda_host_buffer_free_buffer(ggml_backend_buffer_t buffer) {
-    CUDA_CHECK(cudaHostUnregister(buffer->context));
+    // Unregister every chunk that was registered in ggml_cuda_host_malloc().
+    for (size_t off = 0; off < buffer->size; off += ggml_cuda_host_register_chunk_size) {
+        size_t chunk_size = std::min(ggml_cuda_host_register_chunk_size, buffer->size - off);
+        CUDA_CHECK(cudaHostUnregister((char *) buffer->context + off));
+    }
     munmap(buffer->context, buffer->size);
 }
 
@@ -1462,13 +1472,27 @@ static void * ggml_cuda_host_malloc(size_t size) {
         }
     }
 
-    cudaError_t err = cudaHostRegister(ptr, size, cudaHostRegisterPortable);
-    if (err != cudaSuccess) {
-        cudaGetLastError(); // clear the error
-        GGML_CUDA_LOG_WARN("%s: cudaHostRegister of %.2f MiB failed: %s\n", __func__,
-                           size/1024.0/1024.0, cudaGetErrorString(err));
-        munmap(ptr, size);
-        return nullptr;
+    // Register the region in chunks to avoid driver/kernel limits on huge single cudaHostRegister calls.
+    size_t registered = 0;
+    while (registered < size) {
+        size_t chunk_size = std::min(ggml_cuda_host_register_chunk_size, size - registered);
+        cudaError_t err = cudaHostRegister((char *) ptr + registered, chunk_size, cudaHostRegisterPortable);
+        if (err != cudaSuccess) {
+            cudaGetLastError(); // clear the error
+            GGML_CUDA_LOG_WARN("%s: cudaHostRegister of %.2f MiB at offset %.2f GiB failed: %s\n", __func__,
+                               chunk_size/1024.0/1024.0, registered/1024.0/1024.0/1024.0, cudaGetErrorString(err));
+            // Unregister any chunks that were already successfully registered.
+            for (size_t off = 0; off < registered; off += ggml_cuda_host_register_chunk_size) {
+                size_t cs = std::min(ggml_cuda_host_register_chunk_size, registered - off);
+                cudaError_t unreg_err = cudaHostUnregister((char *) ptr + off);
+                if (unreg_err != cudaSuccess) {
+                    cudaGetLastError();
+                }
+            }
+            munmap(ptr, size);
+            return nullptr;
+        }
+        registered += chunk_size;
     }
 
     if (size_GiB > k_warn_limit) {
