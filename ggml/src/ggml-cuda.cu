@@ -4209,7 +4209,22 @@ GGML_CALL static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend,
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
     ggml_cuda_set_device(cuda_ctx->device);
-    CUDA_CHECK(cudaMemcpyAsync((char *)tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+
+    // Large copies from pinned host memory can fail with cudaErrorInvalidValue on
+    // some driver/GPU combinations (observed on Blackwell / driver 580.119.02 /
+    // CUDA 12.8 with a 532 GiB pinned region). Async copies may have an even lower
+    // threshold than sync copies. Chunk the copy to stay well below the limit.
+    // Also clear any prior sticky CUDA error before starting.
+    cudaGetLastError();
+    constexpr size_t k_copy_chunk = 65536; // 64 KiB
+    char * dst = (char *)tensor->data + offset;
+    const char * src = (const char *)data;
+    size_t copied = 0;
+    while (copied < size) {
+        size_t chunk = std::min(k_copy_chunk, size - copied);
+        CUDA_CHECK(cudaMemcpy(dst + copied, src + copied, chunk, cudaMemcpyHostToDevice));
+        copied += chunk;
+    }
 }
 
 GGML_CALL static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
