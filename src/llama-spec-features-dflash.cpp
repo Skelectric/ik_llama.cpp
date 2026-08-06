@@ -135,7 +135,7 @@ static const ggml_tensor * llama_dflash_output_tensor(
 int32_t llama_model_dflash_io_mode(
         const struct llama_model * draft_model,
         const struct llama_model * target_model) {
-    if (draft_model == nullptr || target_model == nullptr || draft_model->arch != LLM_ARCH_DFLASH_DRAFT) {
+    if (draft_model == nullptr || target_model == nullptr || (draft_model->arch != LLM_ARCH_DFLASH && draft_model->arch != LLM_ARCH_DFLASH_DRAFT)) {
         return LLAMA_DFLASH_IO_MODE_INVALID;
     }
 
@@ -219,7 +219,7 @@ bool llama_model_share_dflash_io_tensors(
         return false;
     }
 
-    if (draft_model->arch != LLM_ARCH_DFLASH_DRAFT) {
+    if (draft_model->arch != LLM_ARCH_DFLASH && draft_model->arch != LLM_ARCH_DFLASH_DRAFT) {
         return true;
     }
 

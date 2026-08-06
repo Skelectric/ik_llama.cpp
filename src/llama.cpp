@@ -4769,7 +4769,7 @@ static bool llm_load_tensors(
     if (model.arch == LLM_ARCH_GEMMA4) {
         llm_scale_gate_inp_s(model, use_mmap_buffer);
     }
-    if ((model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE || model.arch == LLM_ARCH_DFLASH_DRAFT) && extra_output_type != GGML_TYPE_COUNT) {
+    if ((model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE || model.arch == LLM_ARCH_DFLASH || model.arch == LLM_ARCH_DFLASH_DRAFT) && extra_output_type != GGML_TYPE_COUNT) {
         llm_requantize_output_tensor(model, extra_output_type);
     }
 
@@ -6095,7 +6095,7 @@ static int llama_decode_internal(
     // reserve output buffer
     n_outputs_embd = has_mtp && cparams.mtp_op_type == MTP_OP_NONE ? n_tokens_all : n_outputs;
     const size_t required_outputs = std::max<size_t>(n_outputs, n_outputs_embd);
-    const bool is_dflash_decode = lctx.model.arch == LLM_ARCH_DFLASH_DRAFT;
+    const bool is_dflash_decode = lctx.model.arch == LLM_ARCH_DFLASH || lctx.model.arch == LLM_ARCH_DFLASH_DRAFT;
     const size_t reserved_outputs = llama_output_reserve(lctx, required_outputs);
     if (reserved_outputs < required_outputs) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %zu outputs\n", __func__, required_outputs);
@@ -6500,7 +6500,7 @@ static int llama_decode_internal(
 
         // extract logits
         {
-            const bool dflash_skip_logits = (lctx.model.arch == LLM_ARCH_DFLASH_DRAFT
+            const bool dflash_skip_logits = ((lctx.model.arch == LLM_ARCH_DFLASH || lctx.model.arch == LLM_ARCH_DFLASH_DRAFT)
                 && !lctx.dflash.draft_tokens.empty());
             if (dflash_skip_logits) {
                 res = nullptr;
@@ -8752,6 +8752,7 @@ enum llama_rope_type llama_rope_type(const struct llama_model * model) {
         case LLM_ARCH_LAGUNA:
         case LLM_ARCH_GEMMA4:
         case LLM_ARCH_GEMMA4_MTP:
+        case LLM_ARCH_DFLASH:
         case LLM_ARCH_DFLASH_DRAFT:
         case LLM_ARCH_GEMMA4_ASSISTANT:
             return LLAMA_ROPE_TYPE_NEOX;

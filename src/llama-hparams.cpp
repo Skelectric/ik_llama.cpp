@@ -103,6 +103,52 @@ static bool load_dflash_target_layer_ids(
     return true;
 }
 
+// Load DSV4 backbone hparams for a DFlash drafter (DSpark).
+// Called when dsv4_hc_mult > 0 (gated by hyper_connection.count in the GGUF).
+// Uses the standard LLM_KV enum system so keys format correctly for both
+// LLM_ARCH_DFLASH ("dflash.*") and LLM_ARCH_DFLASH_DRAFT ("dflash-draft.*").
+static void load_dflash_dsv4_hparams(llama_model_loader & ml, llama_hparams & hparams, llm_arch arch) {
+    ml.get_key(LLM_KV_ATTENTION_Q_LORA_RANK,                hparams.n_lora_q);
+    ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW,             hparams.n_swa);
+    ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,           hparams.n_ff_exp);
+    ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,                  hparams.n_expert_shared);
+    ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,                 hparams.expert_weights_scale);
+    ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,                  hparams.expert_weights_norm, false);
+    ml.get_key(LLM_KV_EXPERT_GATING_FUNC,                   hparams.expert_gating_func);
+    ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_EXP,              hparams.swiglu_limits,        hparams.n_layer);
+    if (!ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_SHEXP,       hparams.swiglu_limits_shared, hparams.n_layer, 0)) {
+        hparams.swiglu_limits_shared = hparams.swiglu_limits;
+    }
+    ml.get_key(LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,         hparams.dsv4_o_group_count);
+    ml.get_key(LLM_KV_ATTENTION_OUTPUT_LORA_RANK,           hparams.dsv4_o_lora_rank);
+    ml.get_key(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, hparams.dsv4_hc_sinkhorn_iters);
+    ml.get_key(LLM_KV_HYPER_CONNECTION_EPSILON,             hparams.dsv4_hc_eps);
+    ml.get_key(LLM_KV_ATTENTION_COMPRESS_ROPE_FREQ_BASE,    hparams.dsv4_compress_rope_base, false);
+
+    // compress_ratios: read into vector then copy to fixed-size array
+    uint32_t n_compress_ratios = 0;
+    if (ml.get_arr_n(LLM_KV_ATTENTION_COMPRESS_RATIOS, n_compress_ratios, false)) {
+        if (n_compress_ratios < hparams.n_layer) {
+            throw std::runtime_error(format("%s: compress_ratios is shorter than block_count",
+                llama_model_arch_name(arch)));
+        }
+        std::vector<uint32_t> compress_ratios;
+        ml.get_arr(ml.llm_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS), compress_ratios);
+        std::copy_n(compress_ratios.begin(), hparams.n_layer, hparams.dsv4_compress_ratios.begin());
+    }
+
+    if (hparams.expert_gating_func != LLM_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS) {
+        throw std::runtime_error(format("%s: DSpark DSV4 draft expects sqrtsoftplus MoE scoring",
+            llama_model_arch_name(arch)));
+    }
+
+    GGML_ASSERT(hparams.n_swa > 0);
+    // All DSV4 draft stages use uniform sliding-window attention
+    std::fill(hparams.swa_layers.begin(), hparams.swa_layers.end(), true);
+    hparams.rope_freq_base_train_swa  = hparams.rope_freq_base_train;
+    hparams.rope_freq_scale_train_swa = 1.0f;
+}
+
 static void validate_dflash_hparams(llama_hparams & hparams, llm_arch arch) {
     if (hparams.dflash_block_size <= 1) {
         throw std::runtime_error(format("%s: dflash block_size must be > 1", llama_model_arch_name(arch)));
@@ -902,6 +948,56 @@ void llm_load_hparams(
                     default: model.type = e_model::MODEL_UNKNOWN;
                 }
             } break;
+        case LLM_ARCH_DFLASH:
+            {
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+
+                // DFlash-specific keys: the upstream/Unsloth GGUF format uses "dflash.*"
+                // (not "dflash.dflash.*" as ik_llama.cpp's DFLASH_DRAFT format does),
+                // so read them with raw key strings.
+                ml.get_key("dflash.block_size",            hparams.dflash_block_size,        false);
+                ml.get_key("tokenizer.ggml.mask_token_id", hparams.dflash_mask_token_id,    false);
+                ml.get_key("dflash.n_target_features",     hparams.dflash_n_target_features, false);
+                ml.get_key("dflash.backbone_rotary_base",  hparams.dflash_backbone_rotary_base, false);
+                load_dflash_target_layer_ids(ml, "dflash.target_layers", hparams, false);
+                ml.get_key(LLM_KV_ATTENTION_VALUE_SCALE, hparams.f_attn_v_scale, false);
+                ml.get_key("dflash.laguna", hparams.dflash_laguna, false);
+                if (hparams.dflash_laguna) {
+                    ml.get_key(LLM_KV_ATTENTION_CAUSAL, hparams.causal_attn);
+                }
+
+                // DSV4 backbone hparams (DSpark drafter): read when hyper_connection.count > 0
+                ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT, hparams.dsv4_hc_mult, false);
+                if (hparams.dsv4_hc_mult > 0) {
+                    load_dflash_dsv4_hparams(ml, hparams, model.arch);
+                } else {
+                    // Optional interleaved sliding-window attention (non-DSV4 backbone)
+                    if (ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa, false) && hparams.n_swa > 0) {
+                        ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.swa_layers, hparams.n_layer, false);
+                        hparams.rope_freq_base_train_swa  = hparams.rope_freq_base_train;
+                        hparams.rope_freq_scale_train_swa = hparams.rope_freq_scale_train;
+                    }
+                }
+
+                // n_target_features may be absent in upstream-format GGUFs;
+                // it will be inferred from the fc tensor shape during tensor loading.
+                if (hparams.dflash_n_target_features > 0) {
+                    validate_dflash_hparams(hparams, model.arch);
+                } else {
+                    if (hparams.dflash_block_size <= 1) {
+                        throw std::runtime_error(format("%s: dflash block_size must be > 1",
+                            llama_model_arch_name(model.arch)));
+                    }
+                    if (hparams.dflash_n_target_layers == 0) {
+                        throw std::runtime_error(format("%s: dflash target_layers are required",
+                            llama_model_arch_name(model.arch)));
+                    }
+                }
+
+                hparams.n_layer_kv_from_start = hparams.n_layer;
+                model.type = e_model::MODEL_UNKNOWN;
+            } break;
+
         case LLM_ARCH_DFLASH_DRAFT:
             {
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
@@ -915,11 +1011,18 @@ void llm_load_hparams(
                 if (hparams.dflash_laguna) {
                     ml.get_key(LLM_KV_ATTENTION_CAUSAL, hparams.causal_attn);
                 }
-                // DFlash drafts may be trained with sliding-window attention (for long-context).
-                // Read the window + per-layer pattern so the SWA mask path activates; absent keys
-                // leave n_swa=0 / swa_layers all-zero (dense behavior, unchanged).
-                ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa, false);
-                ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.swa_layers, hparams.n_layer, false);
+
+                // DSV4 backbone hparams (DSpark drafter): read when hyper_connection.count > 0
+                ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT, hparams.dsv4_hc_mult, false);
+                if (hparams.dsv4_hc_mult > 0) {
+                    load_dflash_dsv4_hparams(ml, hparams, model.arch);
+                } else {
+                    // DFlash drafts may be trained with sliding-window attention (for long-context).
+                    // Read the window + per-layer pattern so the SWA mask path activates; absent keys
+                    // leave n_swa=0 / swa_layers all-zero (dense behavior, unchanged).
+                    ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa, false);
+                    ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.swa_layers, hparams.n_layer, false);
+                }
                 validate_dflash_hparams(hparams, model.arch);
 
                 hparams.n_layer_kv_from_start = hparams.n_layer;
