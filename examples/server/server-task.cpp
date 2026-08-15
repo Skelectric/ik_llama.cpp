@@ -1168,6 +1168,23 @@ server_prompt* server_prompt_cache::alloc(const server_prompt& prompt, size_t st
         }
     }
 
+    // Enforce the cache size limit before allocating: skip caching if the
+    // new state alone would exceed the limit, and evict old states to make
+    // room otherwise.
+    if (limit_size > 0) {
+        if (state_size > limit_size) {
+            LLAMA_LOG_INFO(" - prompt state size (%.3f MiB) exceeds cache limit (%.3f MiB), skipping\n",
+                state_size / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
+            return nullptr;
+        }
+
+        while (!states.empty() && size() + state_size > limit_size) {
+            LLAMA_LOG_INFO(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n",
+                states.front().size() / (1024.0 * 1024.0));
+            states.pop_front();
+        }
+    }
+
     std::vector<uint8_t> state_data;
 
     // check if we can allocate enough memory for the new state
@@ -1203,12 +1220,7 @@ server_prompt* server_prompt_cache::alloc(const server_prompt& prompt, size_t st
 
 void server_prompt_cache::update() {
     if (limit_size > 0) {
-        // always keep at least one state, regardless of the limits
-        while (states.size() > 1 && size() > limit_size) {
-            if (states.empty()) {
-                break;
-            }
-
+        while (!states.empty() && size() > limit_size) {
             LLAMA_LOG_INFO(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
 
             states.pop_front();
