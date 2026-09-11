@@ -1889,6 +1889,7 @@ void llm_load_hparams(
             } break;
         case LLM_ARCH_DFLASH:
         case LLM_ARCH_DEEPSEEK4:
+        case LLM_ARCH_DEEPSEEK41:
         case LLM_ARCH_GLM_DSA:
             {
                 if (model.arch == LLM_ARCH_DFLASH) {
@@ -1934,7 +1935,7 @@ void llm_load_hparams(
                     model.type = e_model::MODEL_UNKNOWN;
                     break;
                 }
-                const bool is_dsv4 = model.arch == LLM_ARCH_DEEPSEEK4 || hparams.dflash_dsv4;
+                const bool is_dsv4 = model.arch == LLM_ARCH_DEEPSEEK4 || model.arch == LLM_ARCH_DEEPSEEK41 || hparams.dflash_dsv4;
                 ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.nextn_predict_layers, false);
                 if (model.arch == LLM_ARCH_DEEPSEEK4 && hparams.n_layer == 43 && hparams.nextn_predict_layers > 0) {
                     LLAMA_LOG_WARN("===============================================================================================\n");
@@ -2066,6 +2067,19 @@ void llm_load_hparams(
                         hparams.dsv4_hc_eps = hparams.f_norm_rms_eps;
                     }
                     ml.get_key(LLM_KV_HASH_LAYER_COUNT, hparams.dsv4_hash_layer_count, false);
+
+                    // DeepSeek-V4.1: engram conditional-memory modules + VL routing bias.
+                    ml.get_key(LLM_KV_ENGRAM_HEAD_COUNT, hparams.dsv4_engram_head_count, false);
+                    ml.get_key(LLM_KV_ENGRAM_KEY_LENGTH, hparams.dsv4_engram_key_length, false);
+                    ml.get_key(LLM_KV_ENGRAM_MAX_NGRAM_SIZE, hparams.dsv4_engram_max_ngram_size, false);
+                    uint32_t n_engram_layers = 0;
+                    if (ml.get_arr_n(LLM_KV_ENGRAM_LAYER_IDS, n_engram_layers, false)) {
+                        ml.get_arr(ml.llm_kv(LLM_KV_ENGRAM_LAYER_IDS), hparams.dsv4_engram_layer_ids, false);
+                        hparams.dsv4_engram_layer_count = n_engram_layers;
+                    }
+                    if (ml.get_tensor_meta(format("blk.%u.exp_probs_b_vl.bias", dsv4_probe_layer).c_str()) != nullptr) {
+                        hparams.dsv4_exp_probs_b_vl = true;
+                    }
 
                     uint32_t n_compress_ratios = 0;
                     if (ml.get_arr_n(LLM_KV_ATTENTION_COMPRESS_RATIOS, n_compress_ratios, false)) {

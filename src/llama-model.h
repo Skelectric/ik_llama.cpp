@@ -351,6 +351,7 @@ struct llama_layer {
     struct ggml_tensor * ffn_up_b   = nullptr; // b3
     struct ggml_tensor * ffn_act = nullptr;
     struct ggml_tensor * ffn_exp_probs_b = nullptr;
+    struct ggml_tensor * ffn_exp_probs_b_vl = nullptr; // deepseek-v4.1 second (VL) routing bias
     struct ggml_tensor * ffn_gate_tid2eid = nullptr;
 
     llama_split_tensor split_ffn_gate_b;
@@ -405,6 +406,12 @@ struct llama_layer {
     struct ggml_tensor * hc_ffn_base      = nullptr;
     struct ggml_tensor * hc_ffn_fn        = nullptr;
     struct ggml_tensor * hc_ffn_scale     = nullptr;
+
+    // deepseek-v4.1 engram conditional-memory module (present on engram layers only)
+    struct ggml_tensor * engram_embd      = nullptr;
+    struct ggml_tensor * engram_k         = nullptr;
+    struct ggml_tensor * engram_q         = nullptr;
+    struct ggml_tensor * engram_wkv       = nullptr;
 
     // qwen4exp low-rank hyper-connections
     struct ggml_tensor * hc_attn_norm     = nullptr;
@@ -640,7 +647,7 @@ struct llama_model {
     }
 
     float swiglu_limit(uint32_t il, bool shared) const {
-        if (arch != LLM_ARCH_STEP35 && arch != LLM_ARCH_BAILINGMOE3 && arch != LLM_ARCH_DEEPSEEK4) {
+        if (arch != LLM_ARCH_STEP35 && arch != LLM_ARCH_BAILINGMOE3 && arch != LLM_ARCH_DEEPSEEK4 && arch != LLM_ARCH_DEEPSEEK41) {
             return 0.0f;
         }
         return shared ? hparams.swiglu_limits_shared[il] : hparams.swiglu_limits[il];

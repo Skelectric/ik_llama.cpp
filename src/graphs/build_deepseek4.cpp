@@ -1507,6 +1507,191 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
     return gf;
 }
 
+// DeepSeek-V4.1 runtime graph (Phase 1: dense-MLA stub).
+//
+// V4.1 shares the MLA-latent + mHC + MoE machinery with V4, but its attention is
+// pure CSA2 (Full/Reindex/Reuse + cross-layer KV sharing + CED) with a
+// Hierarchical Sparse Indexer — NOT V4's CSA/HCA. This stub implements a DENSE
+// MLA-latent layer (the V4 `else` fallback path) with no sparse selection, no
+// CED sharing, no engram, and no indexer, so the graph builds and runs with
+// wrong numerics. It is the base to evolve into full CSA2 (Phase 2+).
+//
+// The head bypasses build_hc_head (V4.1 has no hc_head_*); the hc=4 stream is
+// collapsed by a mean and fed to output_norm + output.
+ggml_cgraph * llm_build_context::build_deepseek41() {
+    ggml_cgraph * gf = new_graph_custom();
+
+    const int64_t n_embd_head = hparams.n_embd_head_k(0);
+    const int64_t n_embd_head_rope = hparams.n_rot;
+    const int64_t n_embd_head_nope = n_embd_head - n_embd_head_rope;
+    const int64_t hc = hparams.dsv4_hc_mult;
+
+    GGML_ASSERT(n_embd_head == hparams.n_embd_head_v(0));
+    GGML_ASSERT(n_embd_head_nope > 0);
+
+    ggml_tensor * inp_pos = build_inp_pos();
+    ggml_tensor * KQ_mask = hparams.n_swa > 0 ? build_inp_KQ_mask_swa() : build_inp_KQ_mask();
+
+    ggml_tensor * inpL = nullptr;
+    ggml_tensor * inp = llm_build_inp_embd(ctx0, lctx, hparams, batch, model.tok_embd, cb);
+    inpL = ggml_reshape_3d(ctx0, inp, n_embd, 1, n_tokens);
+    inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
+    cb(inpL, "hc_init", -1);
+
+    const int n_layer_end = n_layer - hparams.nextn_predict_layers;
+
+    // Rope params (plain; no compress-rope for the dense stub).
+    const float freq_base_l = freq_base;
+    const float freq_scale_l = 1.0f;
+    const float ext_factor_l = 0.0f;
+    const float attn_factor_l = dsv4_rope_attn_factor(freq_scale_l, ext_factor_l);
+    const float beta_fast_l = 0.0f;
+    const float beta_slow_l = 0.0f;
+    const int32_t n_ctx_orig_l = 0;
+
+    for (int il = 0; il < n_layer_end; ++il) {
+        auto & layer = model.layers[il];
+        auto residual = inpL;
+
+        // ---- MLA attention (dense stub) ----
+        ggml_tensor * post = nullptr;
+        ggml_tensor * comb = nullptr;
+        ggml_tensor * cur = build_hc_pre(ctx0, *this, hparams, n_embd, hparams.f_norm_rms_eps, inpL,
+                layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base, &post, &comb, cb, il);
+        cb(cur, "hc_attn_pre", il);
+        cur = llm_build_norm(ctx0, cur, hparams, layer.attn_norm, nullptr, LLM_NORM_RMS, cb, il);
+        cb(cur, "attn_norm", il);
+
+        ggml_tensor * qr = llm_build_lora_mm(lctx, ctx0, layer.wq_a, cur);
+        cb(qr, "qr", il);
+        qr = llm_build_norm(ctx0, qr, hparams, layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, cb, il);
+        cb(qr, "qr_norm", il);
+
+        auto build_rope = [&] (int nhead, ggml_tensor * qin, ggml_tensor * wq, ggml_tensor * norm, const std::string & tag) {
+            auto q = llm_build_lora_mm(lctx, ctx0, wq, qin);
+            cb(q, (tag + "_b").c_str(), il);
+            q = ggml_reshape_2d(ctx0, q, n_embd_head, nhead * n_tokens);
+            q = llm_build_norm(ctx0, q, hparams, norm, nullptr, LLM_NORM_RMS, cb, il);
+            cb(q, (tag + "_norm").c_str(), il);
+            q = ggml_reshape_3d(ctx0, q, n_embd_head, nhead, n_tokens);
+            q = ggml_rope_ext_inplace(ctx0, q, inp_pos, nullptr, n_embd_head_rope, rope_type, n_ctx_orig_l,
+                    freq_base_l, freq_scale_l, ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
+            q->op_params[15] = 1;
+            cb(q, (tag + "_rope").c_str(), il);
+            return q;
+        };
+
+        ggml_tensor * q = build_rope(n_head, qr, layer.wq_b, nullptr, "q");
+        ggml_tensor * kv = build_rope(1, cur, layer.wkv_latent, layer.attn_kv_norm, "kv");
+
+        const float kq_scale = 1.0f / std::sqrt(float(n_embd_head));
+
+        // Store K/V latent (V4 dense mode stores the latent as both k and v).
+        llm_build_kv_store(lctx, ctx0, hparams, cparams, kv_self, gf, kv, nullptr, n_tokens, kv_head, cb, il);
+        if (il < (int64_t) kv_self.v_l.size() && kv_self.v_l[il] != nullptr) {
+            llm_build_kv_store(lctx, ctx0, hparams, cparams, kv_self, gf, nullptr, kv, n_tokens, kv_head, cb, il);
+        }
+
+        // Dense K read (full cache; no sparse selection).
+        ggml_tensor * raw_k = ggml_view_3d(ctx0, kv_self.k_l[il],
+                n_embd_head, hparams.n_head_kv(il), n_kv,
+                ggml_row_size(kv_self.k_l[il]->type, n_embd_head),
+                ggml_row_size(kv_self.k_l[il]->type, n_embd_head) * hparams.n_head_kv(il),
+                0);
+        cb(raw_k, "raw_k", il);
+
+        const int64_t raw_attn_n_kv = std::max<int64_t>(256, GGML_PAD(n_kv, 256));
+        raw_k = dsv4_pad_raw_k_to(ctx0, raw_k, raw_attn_n_kv);
+        ggml_tensor * raw_mask = dsv4_build_raw_mask_view(ctx0, KQ_mask, nullptr, n_kv, n_tokens, 1, cb, il);
+        cb(raw_mask, "raw_mask_view", il);
+        raw_mask = dsv4_pad_mask_tokens(ctx0, raw_mask, n_tokens);
+        raw_mask = dsv4_pad_raw_mask_to(ctx0, raw_mask, raw_attn_n_kv, n_tokens);
+        cb(raw_mask, "dsv4_raw_mask_padded", il);
+
+        ggml_tensor * attn = dsv4_build_attn(ctx0, hparams, cparams, q, raw_k, raw_k, raw_mask,
+                layer.attn_sinks, kq_scale, cb, il, -1, gf);
+        cb(attn, "attn_raw", il);
+        ggml_build_forward_expand(gf, attn);
+
+        // Rope-back + MLA output projection.
+        attn = ggml_reshape_3d(ctx0, attn, n_embd_head, n_head, n_tokens);
+        attn = ggml_rope_ext_inplace(ctx0, attn, inp_pos, nullptr, n_embd_head_rope, rope_type, n_ctx_orig_l,
+                freq_base_l, freq_scale_l, ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
+        attn->op = GGML_OP_ROPE_BACK;
+        attn->op_params[15] = 1;
+        cb(attn, "attn", il);
+
+        const int64_t o_group_dim = layer.wo_a->ne[0];
+        const int64_t n_groups = (n_head * n_embd_head) / o_group_dim;
+        const int64_t o_lora_rank = layer.wo_b->ne[0] / n_groups;
+        GGML_ASSERT((n_head * n_embd_head) % o_group_dim == 0);
+        GGML_ASSERT(layer.wo_b->ne[0] % n_groups == 0);
+
+        attn = ggml_reshape_3d(ctx0, attn, o_group_dim, n_groups, n_tokens);
+        attn = ggml_permute(ctx0, attn, 0, 2, 1, 3);
+        ggml_tensor * oa = ggml_mul_mat(ctx0,
+                ggml_reshape_3d(ctx0, layer.wo_a, layer.wo_a->ne[0], o_lora_rank, n_groups), attn);
+        cb(oa, "attn_wo_a", il);
+        oa = ggml_permute(ctx0, oa, 0, 2, 1, 3);
+        if (n_tokens == 1) {
+            oa = ggml_reshape_2d(ctx0, oa, o_lora_rank * n_groups, n_tokens);
+        } else {
+            oa = ggml_cont_2d(ctx0, oa, o_lora_rank * n_groups, n_tokens);
+        }
+        cur = llm_build_lora_mm(lctx, ctx0, layer.wo_b, oa);
+        cb(cur, "attn_out", il);
+
+        inpL = build_mhc_post(cur, post, residual, comb, n_embd, hc, true);
+        cb(inpL, "hc_attn_post", il);
+
+        // ---- MoE FFN ----
+        residual = inpL;
+        post = nullptr; comb = nullptr;
+        cur = build_hc_pre(ctx0, *this, hparams, n_embd, hparams.f_norm_rms_eps, inpL,
+                layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base, &post, &comb, cb, il);
+        cb(cur, "hc_ffn_pre", il);
+        cur = llm_build_norm(ctx0, cur, hparams, layer.ffn_norm, nullptr, LLM_NORM_RMS, cb, il);
+        cb(cur, "ffn_norm", il);
+
+        ggml_tensor * exp_probs_b = layer.ffn_exp_probs_b;
+        ggml_tensor * selected_experts = nullptr;
+        ggml_tensor * moe_out = llm_build_moe_ffn(ctx0, lctx, cur,
+                layer.ffn_gate_inp, nullptr,
+                layer.ffn_up_exps, nullptr,
+                layer.ffn_gate_exps, nullptr,
+                layer.ffn_down_exps, nullptr,
+                exp_probs_b,
+                n_expert, n_expert_used,
+                LLM_FFN_SILU, hparams.expert_weights_norm,
+                true, hparams.expert_weights_scale,
+                (enum llm_expert_gating_func_type) hparams.expert_gating_func,
+                cb, il, gf, false, layer.ffn_up_gate_exps, nullptr, nullptr, nullptr,
+                selected_experts);
+        ggml_build_forward_expand(gf, moe_out);
+        ggml_tensor * ffn_shexp = llm_build_ffn(ctx0, lctx, nullptr, cur,
+                layer.ffn_up_shexp, nullptr, nullptr,
+                layer.ffn_gate_shexp, nullptr, nullptr,
+                layer.ffn_down_shexp, nullptr, nullptr,
+                nullptr, LLM_FFN_SILU, LLM_FFN_PAR, cb, il);
+        cur = ggml_add(ctx0, moe_out, ffn_shexp);
+        inpL = build_mhc_post(cur, post, residual, comb, n_embd, hc, true);
+        cb(inpL, "hc_ffn_post", il);
+    }
+
+    // ---- Head: collapse hc stream (no hc_head in V4.1) -> output_norm -> output ----
+    ggml_tensor * out = dsv4_hc_mean_for_capture(ctx0, inpL);
+    cb(out, "hc_head_mean", -1);
+    if (model.output_norm != nullptr) {
+        out = llm_build_norm(ctx0, out, hparams, model.output_norm, nullptr, LLM_NORM_RMS, cb, -1);
+        cb(out, "result_norm", -1);
+    }
+    out = build_output(lctx, ctx0, out, model.output, nullptr, cb);
+    cb(out, "result_output", -1);
+    ggml_build_forward_expand(gf, out);
+
+    return gf;
+}
+
 ggml_cgraph * llm_build_context::build_dflash_dsv4() {
     const int64_t n_embd_head = hparams.n_embd_head_k(0);
     const int64_t n_embd_head_rope = hparams.n_rot;

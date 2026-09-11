@@ -154,6 +154,14 @@ struct llama_hparams {
     float    dsv4_hc_eps             = 0.0f;
     std::array<uint32_t, LLAMA_MAX_LAYERS> dsv4_compress_ratios = {};
 
+    // DeepSeek-V4.1 (engram conditional memory + VL routing bias).
+    uint32_t dsv4_engram_head_count   = 0;
+    uint32_t dsv4_engram_key_length   = 0;
+    std::array<uint32_t, LLAMA_MAX_LAYERS> dsv4_engram_layer_ids = {};
+    uint32_t dsv4_engram_layer_count  = 0;
+    uint32_t dsv4_engram_max_ngram_size = 0;
+    bool     dsv4_exp_probs_b_vl      = false;
+
     // qwen4exp. hc_low_rank 0 means the full-rank hyper-connection form; the
     // ple_* group is inert unless the model carries an n-gram embedding layer.
     uint32_t hc_low_rank         = 0;

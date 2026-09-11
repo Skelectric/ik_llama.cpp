@@ -55,6 +55,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_ARCTIC,          "arctic"       },
     { LLM_ARCH_DEEPSEEK2,       "deepseek2"    },
     { LLM_ARCH_DEEPSEEK4,       "deepseek4"    },
+    { LLM_ARCH_DEEPSEEK41,      "deepseek41"   },
     { LLM_ARCH_CHATGLM,         "chatglm"      },
     { LLM_ARCH_GLM4,            "glm4"         },
     { LLM_ARCH_GLM4_MOE,        "glm4moe"      },
@@ -231,6 +232,11 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
 
     { LLM_KV_HASH_LAYER_COUNT,                 "%s.hash_layer_count"                },
 
+    { LLM_KV_ENGRAM_HEAD_COUNT,              "%s.engram.head_count"                 },
+    { LLM_KV_ENGRAM_KEY_LENGTH,              "%s.engram.key_length"                 },
+    { LLM_KV_ENGRAM_LAYER_IDS,               "%s.engram.layer_ids"                  },
+    { LLM_KV_ENGRAM_MAX_NGRAM_SIZE,          "%s.engram.max_ngram_size"             },
+
     { LLM_KV_ROPE_DIMENSION_COUNT,          "%s.rope.dimension_count"                 },
     { LLM_KV_ROPE_DIMENSION_COUNT_SWA,      "%s.rope.dimension_count_swa"             },
     { LLM_KV_ROPE_DIMENSION_COUNT_PER_LAYER,"%s.rope.dimension_count_per_layer"       },
@@ -311,8 +317,14 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
 LLM_KV::LLM_KV(llm_arch arch, const char* suffix) : arch(arch), suffix(suffix) {}
 
 std::string LLM_KV::operator()(llm_kv kv) const {
-    return suffix ? ::format(LLM_KV_NAMES.at(kv), LLM_ARCH_NAMES.at(arch), suffix)
-        : ::format(LLM_KV_NAMES.at(kv), LLM_ARCH_NAMES.at(arch));
+    // TRACK B (temporary): DeepSeek-V4.1 currently reads the un-relabeled GGUF whose
+    // metadata keys use the "deepseek4." prefix (loaded as deepseek41 via
+    // --override-kv general.architecture=str:deepseek41). Substitute "deepseek4" so the
+    // arch-prefixed keys resolve. REVERT this once the GGUF is relabeled to
+    // "deepseek41." keys (miniPC / converter). Tensor names are hardcoded (not affected).
+    const char * arch_name = arch == LLM_ARCH_DEEPSEEK41 ? "deepseek4" : LLM_ARCH_NAMES.at(arch);
+    return suffix ? ::format(LLM_KV_NAMES.at(kv), arch_name, suffix)
+        : ::format(LLM_KV_NAMES.at(kv), arch_name);
 }
 
 const char * llama_model_arch_name(llm_arch arch) {
