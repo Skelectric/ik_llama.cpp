@@ -6808,7 +6808,7 @@ static int llama_decode_internal(
 
             // must run before can_reuse_graph()
             llama_kv_cache_compact_swa(lctx, u_batch.n_tokens);
-            if (lctx.model.arch == LLM_ARCH_DEEPSEEK4 && !llama_prepare_dsv4_graph_inputs(lctx, u_batch, false, false)) {
+            if ((lctx.model.arch == LLM_ARCH_DEEPSEEK4 || lctx.model.arch == LLM_ARCH_DEEPSEEK41) && !llama_prepare_dsv4_graph_inputs(lctx, u_batch, false, false)) {
                 return GGML_STATUS_FAILED;
             }
         }
@@ -6877,7 +6877,7 @@ static int llama_decode_internal(
             return GGML_STATUS_FAILED;
         }
 
-        if (lctx.model.arch == LLM_ARCH_DEEPSEEK4 && !llama_prepare_dsv4_graph_inputs(lctx, u_batch, true, false)) {
+        if ((lctx.model.arch == LLM_ARCH_DEEPSEEK4 || lctx.model.arch == LLM_ARCH_DEEPSEEK41) && !llama_prepare_dsv4_graph_inputs(lctx, u_batch, true, false)) {
             return GGML_STATUS_FAILED;
         }
 
@@ -7736,7 +7736,7 @@ static int32_t llama_kv_cache_update_internal(struct llama_context & lctx) {
         int n_past = lctx.cparams.n_ctx - n_tokens;
         llama_token token = llama_token_bos(&lctx.model); // not actually used by llama_build_graph, but required to choose between token and embedding inputs graph
         llama_batch reserve_batch = llama_batch_get_one(&token, n_tokens, n_past, 0);
-        if (lctx.model.arch == LLM_ARCH_DEEPSEEK4 && !llama_prepare_dsv4_graph_inputs(lctx, reserve_batch, false, true)) {
+        if ((lctx.model.arch == LLM_ARCH_DEEPSEEK4 || lctx.model.arch == LLM_ARCH_DEEPSEEK41) && !llama_prepare_dsv4_graph_inputs(lctx, reserve_batch, false, true)) {
             return GGML_STATUS_FAILED;
         }
         ggml_cgraph * gf = llm_build_context::llama_build_graph(lctx, reserve_batch, true, lctx.cparams.worst_graph_tokens);
@@ -9120,7 +9120,7 @@ struct llama_context * llama_init_from_model(
             int n_past = cparams.n_ctx - n_tokens;
             llama_token token = llama_token_bos(&ctx->model); // not actually used by llama_build_graph, but required to choose between token and embedding inputs graph
             llama_batch reserve_batch = llama_batch_get_one(&token, n_tokens, n_past, 0);
-            if (ctx->model.arch == LLM_ARCH_DEEPSEEK4 && !llama_prepare_dsv4_graph_inputs(*ctx, reserve_batch, false, true)) {
+            if ((ctx->model.arch == LLM_ARCH_DEEPSEEK4 || ctx->model.arch == LLM_ARCH_DEEPSEEK41) && !llama_prepare_dsv4_graph_inputs(*ctx, reserve_batch, false, true)) {
                 llama_free(ctx);
                 return nullptr;
             }

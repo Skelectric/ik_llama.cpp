@@ -2107,6 +2107,72 @@ void llm_load_hparams(
                         }
                     }
 
+                    // Derive the two compressed-group ratios from the distinct nonzero
+                    // compress_ratios, in order of first appearance. V4 = {4,128};
+                    // V4.1 = {2,1}. Replaces the V4-only hardcoded CSA_RATIO/HCA_RATIO.
+                    {
+                        uint32_t csa_ratio = 0, hca_ratio = 0;
+                        for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+                            const uint32_t r = hparams.dsv4_compress_ratios[il];
+                            if (r == 0) continue;
+                            if (csa_ratio == 0) { csa_ratio = r; }
+                            else if (r != csa_ratio && hca_ratio == 0) { hca_ratio = r; }
+                        }
+                        if (csa_ratio != 0) { hparams.dsv4_csa_ratio = csa_ratio; }
+                        if (hca_ratio != 0) { hparams.dsv4_hca_ratio = hca_ratio; }
+                        hparams.dsv4_lid_ratio = std::min(hparams.dsv4_csa_ratio, hparams.dsv4_hca_ratio);
+                    }
+
+                    // Derive cross-layer CSA2 source maps from compress_ratios + the
+                    // layer-group structure. The V4.1 GGUF has NO
+                    // kv_source_layer_ids / index_source_layer_ids, so we derive:
+                    //   - KV source = the group's Full/Reindex layer (encoder: layers
+                    //     2,8,14; decoder: 20 and the Reindex 24,28,32,36)
+                    //   - index source = the same (Full/Reindex); Reuse layers neither
+                    //     own a cache nor run the indexer
+                    //   - kv_src_layer[il] = last KV source at or before il
+                    // For V4 (has explicit source ids OR the ratio!=0/ratio==4 rule),
+                    // the parser path above already set dsv4_compress_ratios; the V4
+                    // source rule is is_kv_source=(ratio!=0), is_index_source=(ratio==4).
+                    // We apply the V4 rule for arch DEEPSEEK4, and the derived
+                    // Full/Reindex/Reuse rule for arch DEEPSEEK41.
+                    {
+                        for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+                            hparams.dsv4_is_kv_source[il]   = false;
+                            hparams.dsv4_is_index_source[il] = false;
+                        }
+                        if (model.arch == LLM_ARCH_DEEPSEEK41) {
+                            // KV-source layers OWN a compressor + indexer K projector:
+                            // layers 2, 8, 14 (encoder Fulls) and 20 (decoder Full).
+                            // Verified against the GGUF tensor distribution: only these
+                            // four layers carry attn_compressor_kv + indexer.attn_k +
+                            // indexer.k_norm.
+                            for (uint32_t s : {2u, 8u, 14u, 20u}) {
+                                hparams.dsv4_is_kv_source[s] = true;
+                            }
+                            // Index-source layers run the indexer and publish a top-k:
+                            // the Full layers (2,8,14,20) + the decoder Reindex layers
+                            // (24,28,32,36). Verified: these carry indexer.attn_q_b +
+                            // indexer.proj.
+                            for (uint32_t s : {2u, 8u, 14u, 20u, 24u, 28u, 32u, 36u}) {
+                                hparams.dsv4_is_index_source[s] = true;
+                            }
+                        } else {
+                            // V4 rule: every compressing layer is its own KV source;
+                            // index source = ratio==4 (CSA group).
+                            for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+                                const uint32_t r = hparams.dsv4_compress_ratios[il];
+                                hparams.dsv4_is_kv_source[il]   = r != 0;
+                                hparams.dsv4_is_index_source[il] = r == 4;
+                            }
+                        }
+                        int32_t src = -1;
+                        for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+                            if (hparams.dsv4_is_kv_source[il]) { src = (int32_t) il; }
+                            hparams.dsv4_kv_src_layer[il] = src;
+                        }
+                    }
+
                     if (hparams.dsv4_hc_mult == 0) {
                         throw std::runtime_error("DeepSeek-V4 hyper_connection.count is missing and could not be inferred");
                     }

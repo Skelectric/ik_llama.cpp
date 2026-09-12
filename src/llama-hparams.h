@@ -153,6 +153,34 @@ struct llama_hparams {
     float    dsv4_compress_rope_base = 0.0f;
     float    dsv4_hc_eps             = 0.0f;
     std::array<uint32_t, LLAMA_MAX_LAYERS> dsv4_compress_ratios = {};
+    // The two compressed-group ratios (the distinct nonzero values in
+    // dsv4_compress_ratios, in order of first appearance). V4 = {4,128}
+    // (CSA indexer group + dense HCA group); V4.1 = {2,1} (both groups use the
+    // indexer path). Derived at load time; replaces the V4-only hardcoded
+    // dsv4_runtime::CSA_RATIO / HCA_RATIO constants.
+    uint32_t dsv4_csa_ratio = 4;
+    uint32_t dsv4_hca_ratio = 128;
+    // The LID (indexer) cache is sized to the SMALLEST compression ratio (JigSawPT:
+    // lid_ratio = min(csa_ratio, hca_ratio)). For V4.1 = min(2,1) = 1, giving the
+    // largest block count so both the encoder (ratio-2) and decoder (ratio-1) index
+    // keys fit in one shared lid cache. For V4 = min(4,128) = 4.
+    uint32_t dsv4_lid_ratio = 4;
+    // Cross-layer CSA2 source maps. `dsv4_is_kv_source[il]` = layer `il` owns a
+    // compressed-K cache (Full/Reindex layers); `dsv4_is_index_source[il]` = it runs
+    // the indexer and publishes a top-k (Full/Reindex). `dsv4_kv_src_layer[il]` = the
+    // last KV source at or before `il` (a layer reads the compressed K / index K of
+    // that source). V4.1 GGUF lacks kv_source_layer_ids/index_source_layer_ids, so
+    // these are DERIVED from compress_ratios + the tech-report layer groups (encoder
+    // 3x6 = 1 Full + 5 Reuse; decoder 5x4, group 1 = 1 Full + 3 Reuse, groups 2-5 =
+    // 1 Reindex + 3 Reuse). V4 sets is_kv_source = (ratio != 0), is_index_source =
+    // (ratio == 4) and kv_src_layer = identity (each compressing layer is its own
+    // source).
+    std::array<bool, LLAMA_MAX_LAYERS> dsv4_is_kv_source   = {};
+    std::array<bool, LLAMA_MAX_LAYERS> dsv4_is_index_source = {};
+    std::array<int32_t, LLAMA_MAX_LAYERS> dsv4_kv_src_layer = {};
+    int32_t dsv4_candidate_source_layer  = -1;
+    uint32_t dsv4_candidate_block_size   = 0;
+    uint32_t dsv4_candidate_topk_blocks  = 0;
 
     // DeepSeek-V4.1 (engram conditional memory + VL routing bias).
     uint32_t dsv4_engram_head_count   = 0;
