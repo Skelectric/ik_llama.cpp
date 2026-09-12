@@ -5,6 +5,7 @@
 #include "llama-sampling.h"
 
 #include "llama-spec-features.h"
+#include "llama-engram.h"
 
 struct llama_model;
 
@@ -620,6 +621,9 @@ struct llama_context {
         std::vector<float> hca_mask_data;
     };
     dsv4_runtime dsv4;
+
+    // DeepSeek-V4.1 engram conditional-memory runtime (see llama-engram.h)
+    llama_engram_runtime engram;
 
     // input tensors
     struct ggml_tensor * inp_tokens;      // I32 [n_batch]

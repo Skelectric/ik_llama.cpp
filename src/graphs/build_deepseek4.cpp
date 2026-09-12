@@ -2,6 +2,7 @@
 #include "../llama-context.h"
 #include "../llama-build-context.h"
 #include "../llama-dsv4.h"
+#include "../llama-engram.h"
 
 #include <algorithm>
 #include <cmath>
@@ -1807,6 +1808,54 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
     return gf;
 }
 
+// V4.1 engram conditional memory: the host-side gather (llama-engram.cpp) has
+// produced `lookup` [24*256, n_tokens]; the graph only projects it to key/value
+// and gates the value into the residual. Port of the reference Engram.forward
+// (inference/model.py) - shapes verified against our GGUF: engram_wkv
+// [6144, 25600] Q8_0, engram_q/engram_k [5120, 4] BF16.
+static ggml_tensor * dsv4_build_engram(
+        ggml_context       * ctx0,
+        float                eps,
+        const llama_layer & layer,
+        ggml_tensor       * lookup,
+        ggml_tensor       * h) {
+    const int64_t n_embd   = h->ne[0];
+    const int64_t hc       = h->ne[1];
+    const int64_t n_tokens = h->ne[2];
+
+    // kv: [hc*n_embd + n_embd, n_tokens] = [25600, n_tokens]
+    ggml_tensor * kv = ggml_mul_mat(ctx0, layer.engram_wkv, lookup);
+
+    // key: the first hc row-blocks of kv, viewed [n_embd, hc, n_tokens]
+    ggml_tensor * key = ggml_view_3d(ctx0, kv, n_embd, hc, n_tokens,
+            n_embd * ggml_element_size(kv), kv->nb[1], 0);
+
+    // q and k only ever appear as a product. They are BF16 in the checkpoint and no
+    // backend multiplies an F32 activation by a BF16 operand, so cast first.
+    ggml_tensor * w = ggml_mul(ctx0,
+            ggml_cast(ctx0, layer.engram_q, GGML_TYPE_F32),
+            ggml_cast(ctx0, layer.engram_k, GGML_TYPE_F32));
+
+    // per-(token, hc-copy) RMS-normalized dot of the residual with the key,
+    // weighted by q*k, scaled by 1/sqrt(n_embd)
+    ggml_tensor * dot = ggml_mul(ctx0, ggml_rms_norm(ctx0, h, eps), ggml_rms_norm(ctx0, key, eps));
+    dot = ggml_sum_rows(ctx0, ggml_mul(ctx0, dot, w));
+    dot = ggml_scale(ctx0, dot, 1.0f / sqrtf((float) n_embd));
+
+    // signed sqrt before the sigmoid, matching the training kernel
+    ggml_tensor * mag  = ggml_sqrt(ctx0, ggml_clamp(ctx0, ggml_abs(ctx0, dot), 1e-6f, INFINITY));
+    ggml_tensor * gate = ggml_sigmoid(ctx0, ggml_mul(ctx0, ggml_sgn(ctx0, dot), mag));
+
+    // value: the last row-block of kv (rows hc*n_embd..(hc+1)*n_embd). It is a
+    // strided view of kv, so it cannot be reshaped: build the repeated shape
+    // directly.
+    ggml_tensor * v3 = ggml_view_3d(ctx0, kv, n_embd, 1, n_tokens,
+            kv->nb[1], kv->nb[1], hc * n_embd * ggml_element_size(kv));
+    ggml_tensor * v  = ggml_repeat_4d(ctx0, v3, n_embd, hc, n_tokens, 1);
+
+    return ggml_add(ctx0, h, ggml_mul(ctx0, v, gate));
+}
+
 // DeepSeek-V4.1 runtime graph (Phase 1: dense-MLA stub).
 //
 // V4.1 shares the MLA-latent + mHC + MoE machinery with V4, but its attention is
@@ -1879,6 +1928,16 @@ ggml_cgraph * llm_build_context::build_deepseek41() {
 
     for (int il = 0; il < n_layer_end; ++il) {
         auto & layer = model.layers[il];
+
+        // ---- V4.1 engram conditional memory (layers 1/14): the host-side gather
+        //      (llama-engram.cpp) produced the lookup input; project it to
+        //      key/value and gate the value into the residual, BEFORE attention.
+        if (lctx.engram.enabled && layer.engram_wkv != nullptr) {
+            ggml_tensor * inp_engram = llama_engram_new_lookup(lctx, ctx0, il, n_tokens);
+            inpL = dsv4_build_engram(ctx0, hparams.f_norm_rms_eps, layer, inp_engram, inpL);
+            cb(inpL, "engram_out", il);
+        }
+
         // ---- CSA2 attention (reuses the V4 ds4_attention machinery: MLA latent +
         //      pooled compressed K + LID indexer top-k selection). For V4.1 both
         //      nonzero-ratio groups route through the indexer path (no dense HCA).

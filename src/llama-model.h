@@ -508,6 +508,10 @@ struct llama_model {
 
     std::string name = "n/a";
 
+    // file the model was loaded from (used to locate sidecar files, e.g. the
+    // V4.1 engram constants)
+    std::string path = "n/a";
+
     llama_hparams hparams = {};
     llama_vocab   vocab;
 

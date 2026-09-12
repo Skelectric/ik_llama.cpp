@@ -20,6 +20,7 @@
 #include "llama-spec-features.h"
 #include "llama-dflash.h"
 #include "llama-dsv4.h"
+#include "llama-engram.h"
 #include "llama-quantize.h"
 
 #include "unicode.h"
@@ -835,6 +836,11 @@ llama_context::llama_context(const llama_model & model)
     dsa_cache_copies.resize(hparams.n_layer);
     openpangu_cache_copies.resize(hparams.n_layer);
     openpangu_cache_copies_mtp.resize(hparams.n_layer);
+
+    // DeepSeek-V4.1 engram: load the hash-constants sidecar next to the model file
+    // (warns + leaves the module disabled when it is missing or fails validation)
+    llama_engram_init(*this);
+
     llama_all_contexts().push_back(this);
 }
 
@@ -5098,6 +5104,8 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
                 params.defer_experts,
                 params.kv_overrides, params.tensor_buft_overrides);
 
+        model.path = fname;
+
         model.hparams.vocab_only = params.vocab_only;
 
         model.mtp = params.mtp;
@@ -6878,6 +6886,11 @@ static int llama_decode_internal(
         }
 
         if ((lctx.model.arch == LLM_ARCH_DEEPSEEK4 || lctx.model.arch == LLM_ARCH_DEEPSEEK41) && !llama_prepare_dsv4_graph_inputs(lctx, u_batch, true, false)) {
+            return GGML_STATUS_FAILED;
+        }
+
+        // V4.1 engram: fill the per-layer lookup inputs (hash + host-side table gather)
+        if (lctx.engram.enabled && !llama_engram_prepare_inputs(lctx, u_batch)) {
             return GGML_STATUS_FAILED;
         }
 
