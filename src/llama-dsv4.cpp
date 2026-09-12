@@ -896,6 +896,37 @@ static void dsv4_set_mask_tensor(
     }
 }
 
+// V4.1 hierarchical indexer: fill the candidate block pin. One row per query
+// token: +inf on the block holding the query's newest visible compressed
+// position (so the half-full tail block survives the block top-k), 0 elsewhere.
+// A query that sees nothing yet pins nothing.
+static void dsv4_set_cand_pin(
+        ggml_tensor * tensor,
+        const llama_context::dsv4_runtime::comp_plan & plan,
+        int32_t n_tokens) {
+    if (tensor == nullptr || tensor->buffer == nullptr) {
+        return;
+    }
+    GGML_ASSERT(tensor->type == GGML_TYPE_F32);
+
+    const int64_t n_blocks = tensor->ne[0];
+    const int64_t block    = plan.n_kv > 0 ? plan.n_kv/n_blocks : 0;
+    GGML_ASSERT(block > 0);
+    GGML_ASSERT((int64_t) plan.n_visible.size() >= (int64_t) n_tokens);
+
+    // layout [n_blocks, n_tokens/n_stream, 1, n_stream]: token i's pin row sits at
+    // flat offset i*n_blocks (stream-major), aligned with its pooled score column.
+    std::vector<float> storage((size_t) ggml_nelements(tensor), 0.0f);
+    for (int32_t i = 0; i < n_tokens; ++i) {
+        const int32_t n_visible = plan.n_visible[(size_t) i];
+        const int64_t last = n_visible > 0 ? (int64_t) (n_visible - 1)/block : -1;
+        if (last >= 0 && last < n_blocks) {
+            storage[(size_t) i*n_blocks + last] = INFINITY;
+        }
+    }
+    ggml_backend_tensor_set(tensor, storage.data(), 0, storage.size()*sizeof(float));
+}
+
 bool llama_context::ensure_dsv4_cache_tensors() {
     const int32_t n_layer = model.hparams.n_layer;
     const int64_t n_embd_head = model.hparams.n_embd_head_k(0);
@@ -1833,6 +1864,7 @@ bool llama_prepare_dsv4_graph_inputs(llama_context & lctx, const llama_batch & b
         dsv4_set_input_tensor(inputs.state_write_pos, plan.state_write_pos);
         if (set_mask) {
             dsv4_set_mask_tensor(inputs.kq_mask, plan, batch.n_tokens);
+            dsv4_set_cand_pin(inputs.cand_pin, plan, batch.n_tokens);
         }
     };
 

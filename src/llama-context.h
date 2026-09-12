@@ -573,6 +573,11 @@ struct llama_context {
             struct ggml_tensor * state_write_idxs_lid = nullptr;
             struct ggml_tensor * state_write_pos = nullptr;
             struct ggml_tensor * kq_mask = nullptr;
+            // V4.1 hierarchical indexer: F32 [n_kv/cand_block, n_tokens/n_stream, 1, n_stream],
+            // +inf on the block holding each query's newest visible compressed position,
+                       // 0 elsewhere. Only allocated when the candidate selection can bite
+            // (n_kv/cand_block > cand_topk_blocks), else stays null (mask = identity).
+            struct ggml_tensor * cand_pin = nullptr;
         };
 
         struct storage {

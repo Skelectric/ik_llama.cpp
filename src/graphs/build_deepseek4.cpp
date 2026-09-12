@@ -94,7 +94,8 @@ static void dsv4_build_plan_inputs(
         const llama_context::dsv4_runtime::comp_plan & plan,
         const char * tag,
         int64_t n_tokens,
-        bool create_mask = true, bool flash_attn = true) {
+        bool create_mask = true, bool flash_attn = true,
+        uint32_t cand_block = 0, uint32_t cand_topk = 0) {
     dsv4_new_i32_input(ctx, &inputs.state_pos, (int64_t) plan.state_pos.size(), (std::string(tag) + "_state_pos").c_str());
     dsv4_new_i32_input(ctx, &inputs.state_persist_src_idxs, (int64_t) plan.state_persist_src_idxs.size(), (std::string(tag) + "_persist_src").c_str());
     dsv4_new_i32_input(ctx, &inputs.state_persist_dst_idxs, (int64_t) plan.state_persist_dst_idxs.size(), (std::string(tag) + "_persist_dst").c_str());
@@ -107,6 +108,18 @@ static void dsv4_build_plan_inputs(
         dsv4_new_mask_input(ctx, &inputs.kq_mask, std::max<int64_t>(1, plan.n_kv), n_tokens, (std::string(tag) + "_kq_mask").c_str(), type);
     } else {
         inputs.kq_mask = nullptr;
+    }
+    inputs.cand_pin = nullptr;
+    if (create_mask && cand_block > 0 && plan.n_kv > 0 &&
+            plan.n_kv % cand_block == 0 && plan.n_kv/cand_block > cand_topk) {
+        // The block pin is only built when the selection can bite: with every block
+        // inside the top-k the mask it produces is the identity. Host-filled each
+        // batch (+inf on the newest block per query, 0 elsewhere).
+        const int64_t n_stream = std::max<int64_t>(1, plan.n_stream);
+        inputs.cand_pin = ggml_new_tensor_4d(ctx, GGML_TYPE_F32,
+                plan.n_kv/cand_block, std::max<int64_t>(1, n_tokens/n_stream), 1, n_stream);
+        ggml_set_input(inputs.cand_pin);
+        ggml_set_name(inputs.cand_pin, (std::string(tag) + "_cand_pin").c_str());
     }
 }
 
@@ -865,6 +878,65 @@ static ggml_tensor * dsv4_build_lid_top_k_shared(
     return selected == nullptr ? nullptr : ggml_cont(ctx0, selected);
 }
 
+// V4.1 hierarchical indexer level-2: pool the (causally masked) index scores
+// into candidate blocks, pin the block holding the newest visible position, keep
+// the top cand_topk_blocks, and expand the verdict back to position granularity
+// as a -inf/0 mask. Returns nullptr when the pin is absent (every block fits the
+// top-k — the mask would be the identity).
+static ggml_tensor * dsv4_build_candidate_mask(
+        ggml_context * ctx0,
+        ggml_tensor * index_score,
+        ggml_tensor * cand_pin,
+        uint32_t cand_topk_blocks,
+        const llm_build_cb & cb, int il) {
+    if (cand_pin == nullptr) {
+        return nullptr;
+    }
+
+    const int64_t n_pos    = index_score->ne[0];
+    const int64_t n_blocks = cand_pin->ne[0];
+
+    GGML_ASSERT(n_blocks > 0 && n_pos % n_blocks == 0);
+    const int64_t block = n_pos/n_blocks;
+
+    // one score per block: its best position. Unreachable positions arrive at -inf.
+    ggml_tensor * bs = ggml_cont(ctx0, index_score);
+    bs = ggml_pool_2d(ctx0, bs, GGML_OP_POOL_MAX, (int) block, 1, (int) block, 1, 0, 0);
+    cb(bs, "cand_block_score", il);
+
+    // the block holding the newest position is only half full and could be
+    // outscored by an older, full one, so it is pinned in
+    bs = ggml_add(ctx0, bs, cand_pin);
+    cb(bs, "cand_block_score_pin", il);
+
+    const int64_t k = std::min<int64_t>((int64_t) cand_topk_blocks, n_blocks);
+    ggml_tensor * top = ggml_cont(ctx0, ggml_top_k(ctx0, bs, (int) k));
+    cb(top, "cand_block_top_k", il);
+
+    // -inf everywhere, 0 on the blocks that were kept
+    ggml_tensor * keep = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, n_blocks, bs->ne[1], bs->ne[3]);
+    keep = ggml_fill(ctx0, keep, -INFINITY);
+
+    ggml_tensor * top3 = ggml_view_4d(ctx0, top, top->ne[0], top->ne[1], top->ne[3], 1,
+            top->nb[1], top->nb[2], top->ne[3]*top->nb[3], 0);
+
+    ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, top3->ne[0], top3->ne[1], top3->ne[2]);
+    zeros = ggml_fill(ctx0, zeros, 0.0f);
+
+    keep = ggml_set_rows(ctx0, keep, zeros, top3);
+    keep = ggml_view_4d(ctx0, keep, keep->ne[1], keep->ne[2], 1, keep->ne[3],
+            keep->nb[2], keep->nb[3], keep->nb[3], 0);
+    cb(keep, "cand_keep", il);
+
+    // back from blocks to positions: every position inherits its block's verdict
+    keep = ggml_reshape_4d(ctx0, keep, 1, n_blocks, keep->ne[1], keep->ne[3]);
+    keep = ggml_repeat_4d(ctx0, keep, block, n_blocks, keep->ne[2], keep->ne[3]);
+    keep = ggml_reshape_4d(ctx0, keep, n_pos, keep->ne[2], 1, keep->ne[3]);
+    cb(keep, "cand_mask", il);
+
+    return keep;
+}
+
 static ggml_tensor * dsv4_build_lid_top_k(
         ggml_context * ctx0,
         llm_build_context & llm,
@@ -872,15 +944,26 @@ static ggml_tensor * dsv4_build_lid_top_k(
         ggml_tensor * cur,
         ggml_tensor * inp_pos,
         int il, ggml_cgraph * gf, const llm_build_cb & cb,
-        ggml_tensor * kq_mask = nullptr) {
+        ggml_tensor * kq_mask = nullptr,
+        ggml_tensor * cand_pin = nullptr, ggml_tensor ** cand_carry = nullptr) {
     const auto & hparams = llm.hparams;
     const auto & layer = llm.model.layers[il];
     const int64_t n_embd_indexer_head = hparams.indexer_head_size;
     const int64_t n_embd_indexer_head_rope = hparams.n_rot;
     const int64_t n_indexer_head = hparams.indexer_n_head;
     const int64_t n_tokens = cur->ne[1];
-    const int64_t n_lid = llm.lctx.dsv4.lid_plan.n_kv;
     const int hadamard_block = llama_model::hadamard_size((int) n_embd_indexer_head);
+
+    // Resolve the GROUP's mask first: V4.1's encoder group scores its ratio-2
+    // blocks against the csa plan's mask, the decoder group its ratio-1 blocks
+    // against the hca plan's mask (passed by the caller). The mask's row count IS
+    // the group's block count (n_lid) — the shared lid cache holds the group's
+    // index keys in its FIRST group_plan.n_kv rows, so the cache read below is
+    // viewed down to n_lid the same way the reference does. For V4 the lid plan
+    // is identical to the csa plan, so this equals the old lid_plan.n_kv.
+    if (kq_mask == nullptr) { kq_mask = llm.lctx.dsv4.inputs.csa.kq_mask; }
+    GGML_ASSERT(kq_mask != nullptr);
+    const int64_t n_lid = kq_mask->ne[0];
 
     GGML_ASSERT(n_embd_indexer_head >= n_embd_indexer_head_rope);
     GGML_ASSERT(n_lid > 0);
@@ -920,6 +1003,16 @@ static ggml_tensor * dsv4_build_lid_top_k(
             llm.lctx.dsv4.lid_ctx,
             n_embd_indexer_head,
             llm.lctx.dsv4.cache.lid_k[lid_src_il]->ne[1]/std::max<uint32_t>(1, llm.lctx.dsv4.cache.n_stream));
+    GGML_ASSERT(indexer_k != nullptr);
+    GGML_ASSERT(n_lid <= indexer_k->ne[2] && "DSV4: group block count exceeds the lid cache read");
+    if (n_lid < indexer_k->ne[2]) {
+        // View the lid-cache read down to the group's block count (the reference
+        // does the same): the encoder's ratio-2 keys occupy only the first
+        // csa_plan.n_kv rows of the ratio-1-sized shared lid cache.
+        indexer_k = ggml_view_4d(ctx0, indexer_k,
+                indexer_k->ne[0], indexer_k->ne[1], n_lid, indexer_k->ne[3],
+                indexer_k->nb[1], indexer_k->nb[2], indexer_k->nb[3], 0);
+    }
     llm.cb(indexer_k, "lid_k", il);
 
     const int64_t n_stream = std::max<int64_t>(1, indexer_k->ne[3]);
@@ -935,12 +1028,24 @@ static ggml_tensor * dsv4_build_lid_top_k(
     indexer_k = ggml_permute(ctx0, indexer_k, 0, 2, 1, 3);
     llm.cb(indexer_k, "lid_k_stream", il);
 
-    if (kq_mask == nullptr) { kq_mask = llm.lctx.dsv4.inputs.csa.kq_mask; }
-    GGML_ASSERT(kq_mask != nullptr);
     ggml_tensor * lid_mask = dsv4_build_raw_mask_view(ctx0,
             kq_mask, nullptr, n_lid, n_tokens, n_stream, cb, il);
+
+    // V4.1 hierarchical indexer: the candidate source layer (the decoder's first
+    // Full layer) publishes a block-level candidate mask pooled from its own
+    // masked scores; every later index source folds the carried mask into its
+    // group mask before picking positions. Layers at or before the source see a
+    // null carry and ignore it. The publisher needs the pooled scores, so it
+    // takes the unfused path; it does NOT filter its own top-k.
+    const bool is_cand_source = cand_carry != nullptr && cand_pin != nullptr &&
+            hparams.dsv4_candidate_source_layer >= 0 && il == hparams.dsv4_candidate_source_layer;
+    if (cand_carry != nullptr && *cand_carry != nullptr && !is_cand_source) {
+        lid_mask = ggml_add(ctx0, lid_mask, *cand_carry);
+        llm.cb(lid_mask, "lid_mask_cand", il);
+    }
+
     const uint32_t n_top_k = (uint32_t) std::min<int64_t>(n_lid, hparams.indexer_top_k);
-    if (llm.cparams.fused_idx_topk && n_lid > n_top_k) {
+    if (!is_cand_source && llm.cparams.fused_idx_topk && n_lid > n_top_k) {
         if (ggml_tensor * selected = dsv4_build_lid_top_k_shared(ctx0,
                     indexer_k, indexer_q, indexer_weights, lid_mask, (int) n_top_k, cb)) {
             if (selected) {
@@ -965,6 +1070,12 @@ static ggml_tensor * dsv4_build_lid_top_k(
 
     indexer_score = ggml_add(ctx0, indexer_score, lid_mask);
     llm.cb(indexer_score, "lid_score_masked", il);
+
+    if (is_cand_source) {
+        // publish the block-level candidate selection for every later index source
+        *cand_carry = dsv4_build_candidate_mask(ctx0, indexer_score, cand_pin,
+                hparams.dsv4_candidate_topk_blocks, cb, il);
+    }
 
     ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, indexer_score, n_top_k));
     llm.cb(top_k, "lid_top_k", il);
@@ -1052,7 +1163,8 @@ static ggml_tensor * ds4_attention(ggml_cgraph * gf, ggml_context * ctx0, llm_bu
         ggml_tensor ** append_csa_state, ggml_tensor ** append_csa_score,
         ggml_tensor ** append_lid_state, ggml_tensor ** append_lid_score,
         ggml_tensor * inp_pos, ggml_tensor * KQ_mask, ggml_tensor * KQ_mask_swa_win, int il,
-        ggml_tensor ** topk_carry = nullptr, ggml_tensor ** hc_carry = nullptr) {
+        ggml_tensor ** topk_carry = nullptr, ggml_tensor ** hc_carry = nullptr,
+        ggml_tensor ** cand_carry = nullptr) {
 
     ggml_tensor * residual = inpL;
     ggml_tensor * post = nullptr;
@@ -1351,7 +1463,8 @@ static ggml_tensor * ds4_attention(ggml_cgraph * gf, ggml_context * ctx0, llm_bu
                 GGML_ASSERT(topk_carry && *topk_carry && "DSV4: layer reuses a top-k no index source produced");
                 top_k = *topk_carry;
             } else {
-                top_k = dsv4_build_lid_top_k(ctx0, llm, qr, cur, inp_pos, il, gf, cb);
+                top_k = dsv4_build_lid_top_k(ctx0, llm, qr, cur, inp_pos, il, gf, cb,
+                        nullptr, lctx.dsv4.inputs.csa.cand_pin, cand_carry);
                 if (topk_carry) { *topk_carry = top_k; }
             }
             if (n_tokens == 1) {
@@ -1392,7 +1505,8 @@ static ggml_tensor * ds4_attention(ggml_cgraph * gf, ggml_context * ctx0, llm_bu
                     GGML_ASSERT(topk_carry && *topk_carry && "DSV4: layer reuses a top-k no index source produced");
                     top_k = *topk_carry;
                 } else {
-                    top_k = dsv4_build_lid_top_k(ctx0, llm, qr, cur, inp_pos, il, gf, cb, lctx.dsv4.inputs.hca.kq_mask);
+                    top_k = dsv4_build_lid_top_k(ctx0, llm, qr, cur, inp_pos, il, gf, cb, lctx.dsv4.inputs.hca.kq_mask,
+                            lctx.dsv4.inputs.hca.cand_pin, cand_carry);
                     if (topk_carry) { *topk_carry = top_k; }
                 }
                 if (n_tokens == 1) {
@@ -1721,8 +1835,10 @@ ggml_cgraph * llm_build_context::build_deepseek41() {
     dsv4_new_i32_input(ctx0, &lctx.dsv4.inputs.raw_k_write_src_idxs, (int64_t) lctx.dsv4.raw.write_src_idxs.size(), "dsv4_raw_k_write_src_idxs");
     dsv4_new_i32_input(ctx0, &lctx.dsv4.inputs.raw_k_write_idxs, (int64_t) lctx.dsv4.raw.write_dst_idxs.size(), "dsv4_raw_k_write_idxs");
     dsv4_new_i32_input(ctx0, &lctx.dsv4.inputs.raw_k_read_idxs, (int64_t) lctx.dsv4.raw.read_dst_idxs.size(), "dsv4_raw_k_read_idxs");
-    dsv4_build_plan_inputs(ctx0, lctx.dsv4.inputs.csa, lctx.dsv4.csa_plan, "dsv4_csa", n_tokens, true, lctx.cparams.flash_attn);
-    dsv4_build_plan_inputs(ctx0, lctx.dsv4.inputs.hca, lctx.dsv4.hca_plan, "dsv4_hca", n_tokens, true, lctx.cparams.flash_attn);
+    dsv4_build_plan_inputs(ctx0, lctx.dsv4.inputs.csa, lctx.dsv4.csa_plan, "dsv4_csa", n_tokens, true, lctx.cparams.flash_attn,
+            hparams.dsv4_candidate_block_size, hparams.dsv4_candidate_topk_blocks);
+    dsv4_build_plan_inputs(ctx0, lctx.dsv4.inputs.hca, lctx.dsv4.hca_plan, "dsv4_hca", n_tokens, true, lctx.cparams.flash_attn,
+            hparams.dsv4_candidate_block_size, hparams.dsv4_candidate_topk_blocks);
     dsv4_build_plan_inputs(ctx0, lctx.dsv4.inputs.lid, lctx.dsv4.lid_plan, "dsv4_lid", n_tokens, false, lctx.cparams.flash_attn);
 
     ggml_tensor * inp_pos = build_inp_pos();
@@ -1749,6 +1865,12 @@ ggml_cgraph * llm_build_context::build_deepseek41() {
     // picked; Reuse layers after it consume it instead of re-running the indexer.
     ggml_tensor * topk_carry = nullptr;
 
+    // V4.1 hierarchical indexer: the candidate source layer (20) publishes a
+    // block-level candidate mask; every later index source folds it into its own
+    // group mask before its top-k.
+    ggml_tensor * cand_carry_v = nullptr;
+    ggml_tensor ** cand_carry = &cand_carry_v;
+
     // V4.1 hyper-connection mix threading: each sublayer's pre mix feeds the NEXT
     // sublayer (V4 collapses in place). The final head collapses with the mix the
     // last FFN produced, so the carry must outlive the layer loop.
@@ -1763,7 +1885,7 @@ ggml_cgraph * llm_build_context::build_deepseek41() {
         inpL = ds4_attention(gf, ctx0, *this, inpL,
                 &append_csa_state, &append_csa_score,
                 &append_lid_state, &append_lid_score,
-                inp_pos, KQ_mask, nullptr, il, &topk_carry, hc_carry);
+                inp_pos, KQ_mask, nullptr, il, &topk_carry, hc_carry, cand_carry);
 
         // ---- MoE FFN ----
         ggml_tensor * residual = inpL;

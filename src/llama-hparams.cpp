@@ -2192,6 +2192,32 @@ void llm_load_hparams(
                         }
                     }
 
+                    // V4.1 hierarchical sparse indexer candidate pool (tech report
+                    // §4.2): the decoder's first Full layer (20) publishes a block-
+                    // level candidate selection (max-pooled blocks of 8 compressed
+                    // rows, top-2048) and every later index source filters its own
+                    // scores with it. The GGUF may carry the keys; when absent we
+                    // derive the tech-report constants. Parsed only for DEEPSEEK41
+                    // so V4 keeps its inert defaults (candidate_block_size == 0)
+                    // and stays bit-unchanged.
+                    if (model.arch == LLM_ARCH_DEEPSEEK41) {
+                        {
+                            uint32_t src = 0;
+                            if (ml.get_key(LLM_KV_CANDIDATE_SOURCE_LAYER, src, false)) {
+                                hparams.dsv4_candidate_source_layer = (int32_t) src;
+                            }
+                        }
+                        ml.get_key(LLM_KV_CANDIDATE_BLOCK_SIZE,  hparams.dsv4_candidate_block_size,  false);
+                        ml.get_key(LLM_KV_CANDIDATE_TOPK_BLOCKS, hparams.dsv4_candidate_topk_blocks, false);
+                        // derive only what is missing, so explicit keys / overrides win
+                        if (hparams.dsv4_candidate_source_layer < 0) { hparams.dsv4_candidate_source_layer = 20; }
+                        if (hparams.dsv4_candidate_block_size == 0)  { hparams.dsv4_candidate_block_size  = 8; }
+                        if (hparams.dsv4_candidate_topk_blocks == 0) { hparams.dsv4_candidate_topk_blocks = 2048; }
+                        LLAMA_LOG_INFO("%s: DSV4.1 hierarchical indexer: candidate source layer = %d, block size = %u, top-k blocks = %u\n",
+                                __func__, hparams.dsv4_candidate_source_layer,
+                                hparams.dsv4_candidate_block_size, hparams.dsv4_candidate_topk_blocks);
+                    }
+
                     if (hparams.dsv4_hc_mult == 0) {
                         throw std::runtime_error("DeepSeek-V4 hyper_connection.count is missing and could not be inferred");
                     }
