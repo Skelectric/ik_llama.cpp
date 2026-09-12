@@ -4796,10 +4796,19 @@ static bool llm_load_tensors(
         LLAMA_LOG_WARN("%s: --defer-ple had no effect: creating the tensors disabled mmap\n", __func__);
     }
 
+    bool defer_engram_mmap = ml.should_defer_engram_mmaps();
+    if (defer_engram_mmap && use_mlock) {
+        LLAMA_LOG_WARN("%s: deferred engram loading disabled because mlock keeps mmap ranges resident\n", __func__);
+        defer_engram_mmap = false;
+    }
+    if (ml.defer_engram && !ml.use_mmap && !ml.engram_tensor_index.empty()) {
+        LLAMA_LOG_WARN("%s: --defer-engram had no effect: creating the tensors disabled mmap\n", __func__);
+    }
+
     ml.done_getting_tensors();
 
     // --dry-run skips MAP_POPULATE/WILLNEED — tensor data is never read.
-    ml.init_mappings(!defer_expert_mmap && !defer_ple_mmap && !dry_run, use_mlock ? &model.mlock_mmaps : nullptr, ml.use_thp);
+    ml.init_mappings(!defer_expert_mmap && !defer_ple_mmap && !defer_engram_mmap && !dry_run, use_mlock ? &model.mlock_mmaps : nullptr, ml.use_thp);
 
     // dropping a range discards an anonymous huge-page mapping, so test the mapping and not the -thp flag
     if (ml.has_anonymous_mapping()) {
@@ -4811,10 +4820,18 @@ static bool llm_load_tensors(
             LLAMA_LOG_WARN("%s: deferred per-layer token embedding disabled because the model is mapped on huge pages\n", __func__);
             defer_ple_mmap = false;
         }
+        if (defer_engram_mmap) {
+            LLAMA_LOG_WARN("%s: deferred engram loading disabled because the model is mapped on huge pages\n", __func__);
+            defer_engram_mmap = false;
+        }
     }
     if (defer_ple_mmap && !dry_run) {
         LLAMA_LOG_INFO("%s: deferring %.2f GiB of per-layer token embedding to the file\n", __func__,
                 ml.ple_tensor_index.deferred_bytes / 1024.0 / 1024.0 / 1024.0);
+    }
+    if (defer_engram_mmap && !dry_run) {
+        LLAMA_LOG_INFO("%s: deferring %.2f GiB of engram tables to the file\n", __func__,
+                ml.engram_tensor_index.deferred_bytes / 1024.0 / 1024.0 / 1024.0);
     }
 
     model.mappings.reserve(ml.mappings.size());
@@ -4961,6 +4978,9 @@ static bool llm_load_tensors(
         if (defer_ple_mmap) {
             ml.apply_ple_mmap_policy();
         }
+        if (defer_engram_mmap) {
+            ml.apply_engram_mmap_policy();
+        }
     }
 
     if (model.is_mla_model()) {
@@ -5083,6 +5103,7 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
         model.mtp = params.mtp;
 
         ml.defer_ple = params.defer_ple;
+        ml.defer_engram = params.defer_engram;
 
         try {
             llm_load_arch(ml, model);
@@ -5122,6 +5143,20 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
             }
 #else
             LLAMA_LOG_WARN("%s: deferred per-layer token embedding is only supported on Linux; ignoring defer_ple\n", __func__);
+#endif
+        }
+        if (params.defer_engram) {
+#ifdef __linux__
+            if (!params.use_mmap) {
+                LLAMA_LOG_WARN("%s: --defer-engram had no effect: mmap is disabled\n", __func__);
+            } else {
+                ml.build_engram_tensor_index();
+                if (ml.engram_tensor_index.empty()) {
+                    LLAMA_LOG_WARN("%s: --defer-engram had no effect: no engram tensors\n", __func__);
+                }
+            }
+#else
+            LLAMA_LOG_WARN("%s: deferred engram tables are only supported on Linux; ignoring defer_engram\n", __func__);
 #endif
         }
         try {
@@ -7977,6 +8012,7 @@ struct llama_model_params llama_model_default_params() {
         /*.flash_attn                  =*/ true,
         /*.defer_experts               =*/ false,
         /*.defer_ple                   =*/ false,
+        /*.defer_engram                =*/ false,
         /*.swa_compress                =*/ false,
     };
 

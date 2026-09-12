@@ -54,6 +54,7 @@ struct llama_model_loader {
     bool merge_up_gate_exps = false;
     bool defer_experts = false;
     bool defer_ple = false;
+    bool defer_engram = false;
 
     llama_files files;
     llama_ftype ftype;
@@ -95,6 +96,7 @@ struct llama_model_loader {
     mutable llm_arch resolved_arch = LLM_ARCH_UNKNOWN;
     llama_expert_tensor_index expert_tensor_index;
     llama_expert_tensor_index ple_tensor_index;
+    llama_expert_tensor_index engram_tensor_index;
 
     llama_model_loader(const std::string & fname, int ncmoe, bool use_mmap, bool check_tensors, bool repack_tensors, bool use_thp,
             bool merge_qkv, bool merge_up_gate_exps, bool defer_experts,
@@ -197,6 +199,12 @@ struct llama_model_loader {
     bool should_defer_ple_mmaps() const;
 
     void apply_ple_mmap_policy() const;
+
+    void build_engram_tensor_index();
+
+    bool should_defer_engram_mmaps() const;
+
+    void apply_engram_mmap_policy() const;
 
     void get_mapping_range(size_t * first, size_t * last, void ** addr, int idx, ggml_context * ctx) const;
 

@@ -1679,6 +1679,15 @@ ggml_cgraph * llm_build_context::build_deepseek41() {
     }
 
     // ---- Head: collapse hc stream (no hc_head in V4.1) -> output_norm -> output ----
+    // If fewer output rows than tokens (n_outputs != n_tokens), select the rows
+    // via inp_out_ids so the assert at llama.cpp:5551 is satisfied.
+    if (n_outputs != n_tokens) {
+        ggml_tensor * inp_out_ids = build_inp_out_ids();
+        ggml_tensor * flat = ggml_reshape_2d(ctx0, inpL, n_embd*hc, n_tokens);
+        flat = ggml_get_rows(ctx0, flat, inp_out_ids);
+        inpL = ggml_reshape_3d(ctx0, flat, n_embd, hc, n_outputs);
+    }
+
     ggml_tensor * out = dsv4_hc_mean_for_capture(ctx0, inpL);
     cb(out, "hc_head_mean", -1);
     if (model.output_norm != nullptr) {
