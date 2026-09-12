@@ -636,7 +636,8 @@ static ggml_tensor * build_hc_pre(
         ggml_tensor * hc_base,
         ggml_tensor ** post_out,
         ggml_tensor ** comb_out,
-        const llm_build_cb & cb, int il) {
+        const llm_build_cb & cb, int il,
+        ggml_tensor ** carry = nullptr) {
     const int64_t hc         = hparams.dsv4_hc_mult;
     const int64_t nt         = x->ne[2];
 
@@ -658,7 +659,20 @@ static ggml_tensor * build_hc_pre(
     *post_out = post;
     *comb_out = comb;
 
-    return llm.build_mhc_weighted_sum(x, pre, n_embd, hc);
+    if (carry == nullptr) {
+        // V4: collapse in place with this sublayer's own mix.
+        return llm.build_mhc_weighted_sum(x, pre, n_embd, hc);
+    }
+
+    // V4.1 threads the hyper-connection mix one sublayer ahead: the mix computed
+    // here feeds the NEXT sublayer, and this sublayer collapses with the previous
+    // one's. The first sublayer has no predecessor; the reference starts from a
+    // one-hot on stream 0 (make_identity_pre_mix), which is just that stream.
+    ggml_tensor * result = *carry
+        ? llm.build_mhc_weighted_sum(x, *carry, n_embd, hc)
+        : ggml_cont(ctx0, ggml_view_2d(ctx0, x, n_embd, nt, x->nb[2], 0));
+    *carry = pre;
+    return result;
 }
 
 static ggml_tensor * build_hc_head(
@@ -1038,7 +1052,7 @@ static ggml_tensor * ds4_attention(ggml_cgraph * gf, ggml_context * ctx0, llm_bu
         ggml_tensor ** append_csa_state, ggml_tensor ** append_csa_score,
         ggml_tensor ** append_lid_state, ggml_tensor ** append_lid_score,
         ggml_tensor * inp_pos, ggml_tensor * KQ_mask, ggml_tensor * KQ_mask_swa_win, int il,
-        ggml_tensor ** topk_carry = nullptr) {
+        ggml_tensor ** topk_carry = nullptr, ggml_tensor ** hc_carry = nullptr) {
 
     ggml_tensor * residual = inpL;
     ggml_tensor * post = nullptr;
@@ -1065,7 +1079,7 @@ static ggml_tensor * ds4_attention(ggml_cgraph * gf, ggml_context * ctx0, llm_bu
             layer.hc_attn_fn,
             layer.hc_attn_scale,
             layer.hc_attn_base,
-            &post, &comb, llm.cb, il);
+            &post, &comb, llm.cb, il, hc_carry);
     llm.cb(cur, "hc_attn_pre", il);
 
     cur = llm.llm_build_norm(ctx0, cur, hparams, layer.attn_norm, nullptr, LLM_NORM_RMS, llm.cb, il);
@@ -1725,11 +1739,21 @@ ggml_cgraph * llm_build_context::build_deepseek41() {
     inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
     cb(inpL, "hc_init", -1);
 
+    // V4.1's GGUF has block_count = backbone only (no MTP blocks in the file);
+    // the hparams loader probes for blk.{n_layer} tensors and zeroes
+    // nextn_predict_layers when they are absent, so this V4-convention formula
+    // yields the full backbone layer count (n_layer - 0).
     const int n_layer_end = n_layer - hparams.nextn_predict_layers;
 
     // V4.1 cross-layer top-k carry: an index-source layer publishes the top-k it
     // picked; Reuse layers after it consume it instead of re-running the indexer.
     ggml_tensor * topk_carry = nullptr;
+
+    // V4.1 hyper-connection mix threading: each sublayer's pre mix feeds the NEXT
+    // sublayer (V4 collapses in place). The final head collapses with the mix the
+    // last FFN produced, so the carry must outlive the layer loop.
+    ggml_tensor * hc_carry_v = nullptr;
+    ggml_tensor ** hc_carry = &hc_carry_v;
 
     for (int il = 0; il < n_layer_end; ++il) {
         auto & layer = model.layers[il];
@@ -1739,14 +1763,14 @@ ggml_cgraph * llm_build_context::build_deepseek41() {
         inpL = ds4_attention(gf, ctx0, *this, inpL,
                 &append_csa_state, &append_csa_score,
                 &append_lid_state, &append_lid_score,
-                inp_pos, KQ_mask, nullptr, il, &topk_carry);
+                inp_pos, KQ_mask, nullptr, il, &topk_carry, hc_carry);
 
         // ---- MoE FFN ----
         ggml_tensor * residual = inpL;
         ggml_tensor * post = nullptr;
         ggml_tensor * comb = nullptr;
         ggml_tensor * cur = build_hc_pre(ctx0, *this, hparams, n_embd, hparams.f_norm_rms_eps, inpL,
-                layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base, &post, &comb, cb, il);
+                layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base, &post, &comb, cb, il, hc_carry);
         cb(cur, "hc_ffn_pre", il);
         cur = llm_build_norm(ctx0, cur, hparams, layer.ffn_norm, nullptr, LLM_NORM_RMS, cb, il);
         cb(cur, "ffn_norm", il);
@@ -1778,15 +1802,26 @@ ggml_cgraph * llm_build_context::build_deepseek41() {
     // ---- Head: collapse hc stream (no hc_head in V4.1) -> output_norm -> output ----
     // If fewer output rows than tokens (n_outputs != n_tokens), select the rows
     // via inp_out_ids so the assert at llama.cpp:5551 is satisfied.
+    ggml_tensor * inp_out_ids = nullptr;
     if (n_outputs != n_tokens) {
-        ggml_tensor * inp_out_ids = build_inp_out_ids();
+        inp_out_ids = build_inp_out_ids();
         ggml_tensor * flat = ggml_reshape_2d(ctx0, inpL, n_embd*hc, n_tokens);
         flat = ggml_get_rows(ctx0, flat, inp_out_ids);
         inpL = ggml_reshape_3d(ctx0, flat, n_embd, hc, n_outputs);
     }
 
-    ggml_tensor * out = dsv4_hc_mean_for_capture(ctx0, inpL);
-    cb(out, "hc_head_mean", -1);
+    // V4.1 has no dedicated head weights: collapse with the mix the last FFN
+    // produced (the carried pre), not with a recomputed or uniform one. The mix
+    // is per-token [hc, n_tokens]; row-select it when the output rows were
+    // selected above.
+    GGML_ASSERT(hc_carry_v != nullptr && "DEEPSEEK41 hc: no mix carried to the final collapse");
+    ggml_tensor * head_mix = hc_carry_v;
+    if (head_mix->ne[1] != inpL->ne[2]) {
+        GGML_ASSERT(inp_out_ids != nullptr);
+        head_mix = ggml_get_rows(ctx0, head_mix, inp_out_ids);
+    }
+    ggml_tensor * out = build_mhc_weighted_sum(inpL, head_mix, n_embd, hc);
+    cb(out, "hc_head", -1);
     if (model.output_norm != nullptr) {
         out = llm_build_norm(ctx0, out, hparams, model.output_norm, nullptr, LLM_NORM_RMS, cb, -1);
         cb(out, "result_norm", -1);

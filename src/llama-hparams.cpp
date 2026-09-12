@@ -1945,6 +1945,25 @@ void llm_load_hparams(
                     LLAMA_LOG_WARN("===============================================================================================\n");
                     hparams.nextn_predict_layers = 0;
                 }
+                // V4.1 GGUFs carry block_count = backbone ONLY: the MTP predictor
+                // blocks are not separate blocks in the file (compress_ratios lists
+                // nextn extra descriptors beyond n_layer, but no blk.{n_layer}+
+                // tensors exist). The runtime otherwise assumes block_count INCLUDES
+                // the MTP layers (the V4 convention) and sizes the KV cache / graph
+                // for n_layer - nextn backbone layers, silently dropping the last
+                // nextn real layers. Probe for the first MTP block and zero nextn
+                // when it is absent so every downstream n_layer - nextn site sees
+                // the true backbone count.
+                if (model.arch == LLM_ARCH_DEEPSEEK41 && hparams.nextn_predict_layers > 0) {
+                    const std::string dsv41_mtp_probe = format("blk.%u.attn_norm.weight", hparams.n_layer);
+                    if (ml.get_tensor_meta(dsv41_mtp_probe.c_str()) == nullptr) {
+                        LLAMA_LOG_WARN("%s: deepseek41 GGUF carries no blk.%u MTP blocks (block_count = backbone only)\n",
+                                __func__, hparams.n_layer);
+                        LLAMA_LOG_WARN("%s:  -> setting nextn_predict_layers to zero so all %u layers are treated as backbone\n",
+                                __func__, hparams.n_layer);
+                        hparams.nextn_predict_layers = 0;
+                    }
+                }
                 // Probe the first appended predictor block, or n_layer - 1 for base GGUFs.
                 const uint32_t dsv4_probe_offset = std::max<uint32_t>(1, hparams.nextn_predict_layers);
                 const uint32_t dsv4_probe_layer = hparams.n_layer > dsv4_probe_offset
