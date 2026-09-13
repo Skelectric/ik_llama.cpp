@@ -653,6 +653,139 @@ bool llama_prepare_dflash_graph_inputs(
     }
     ggml_backend_tensor_set(draft_tail_rows, draft_tail_rows_data.data(), 0, ggml_nbytes(draft_tail_rows));
 
+    // TEMP-DEBUG (dspark): dump the draft attention geometry
+    if (getenv("DSPARK_DUMP")) {
+        int32_t n_valid = 0;
+        for (int32_t k = 0; k < cross_ctx; k++) {
+            n_valid += lctx.dflash.kv.cache_slot_valid[(size_t) k] ? 1 : 0;
+        }
+        fprintf(stderr, "[dflash-geo] n_tokens=%u cross_ctx=%d n_valid_slots=%d n_rows=%d last_target_pos=%d swa=%d n_swa_h=%d causal=%d\n",
+                n_tokens, cross_ctx, n_valid, n_rows, (int) last_target_pos,
+                (int) lctx.model.hparams.n_swa, (int) lctx.model.hparams.n_swa,
+                lctx.cparams.causal_attn ? 1 : 0);
+        fprintf(stderr, "[dflash-geo] slot positions (first 8): ");
+        for (int32_t k = 0; k < std::min(cross_ctx, 8); k++) {
+            fprintf(stderr, "%d%s", (int) lctx.dflash.target.pos_ctx_data[(size_t) k],
+                    lctx.dflash.kv.cache_slot_valid[(size_t) k] ? "" : "(inv)");
+            fprintf(stderr, " ");
+        }
+        fprintf(stderr, "| last 4: ");
+        for (int32_t k = std::max(0, cross_ctx - 4); k < cross_ctx; k++) {
+            fprintf(stderr, "%d%s ", (int) lctx.dflash.target.pos_ctx_data[(size_t) k],
+                    lctx.dflash.kv.cache_slot_valid[(size_t) k] ? "" : "(inv)");
+        }
+        fprintf(stderr, "\n[dflash-geo] mask visible counts per draft row (window|draft): ");
+        {
+            const int32_t draft_pos_base0 = (int32_t) last_target_pos + 1;
+            for (uint32_t j = 0; j < n_tokens && j < 5; j++) {
+                int32_t w = 0;
+                const int32_t q_pos = draft_pos_base0 + (int32_t) j;
+                for (int32_t k = 0; k < cross_ctx; k++) {
+                    if (!lctx.dflash.kv.cache_slot_valid[(size_t) k]) continue;
+                    if (q_pos - (int32_t) lctx.dflash.target.pos_ctx_data[(size_t) k] < (int32_t) lctx.model.hparams.n_swa) w++;
+                }
+                int32_t d = 0;
+                for (int32_t bk = 0; bk < (int32_t) n_tokens; bk++) {
+                    if ((!lctx.cparams.causal_attn || bk <= (int32_t) j) && ((int32_t) j - bk) < (int32_t) lctx.model.hparams.n_swa) d++;
+                }
+                fprintf(stderr, "%d/%d ", w, d);
+            }
+        }
+        fprintf(stderr, "\n");
+
+        // Dump the actual window KV content: are the cached rows real or zeros?
+        fprintf(stderr, "[dflash-geo] k_ctx_cache.size=%zu v_ctx_cache.size=%zu n_valid=%d kq_mask_swa=%p\n",
+                lctx.dflash.kv.k_ctx_cache.size(), lctx.dflash.kv.v_ctx_cache.size(), n_valid,
+                (void *) lctx.dflash.kv.kq_mask_swa_tensor);
+        if (lctx.dflash.kv.cache_input_target_features != nullptr) {
+            ggml_tensor * tf = lctx.dflash.kv.cache_input_target_features;
+            const int32_t row_width = (int32_t) tf->ne[0];
+            std::vector<float> row((size_t) row_width);
+            ggml_backend_tensor_get(tf, row.data(), 0, (size_t) row_width * sizeof(float));
+            double sum = 0.0, amax = 0.0;
+            int32_t nz = 0, nan = 0;
+            for (int32_t i2 = 0; i2 < row_width; ++i2) {
+                const double v = row[(size_t) i2];
+                if (std::isnan(v) || std::isinf(v)) nan++;
+                if (v != 0.0) nz++;
+                sum += std::fabs(v);
+                amax = std::max(amax, std::fabs(v));
+            }
+            fprintf(stderr, "[dflash-geo] target_features row0 width=%d meanabs=%.6g maxabs=%.6g nonzero=%d nan=%d\n",
+                    row_width, sum / (double) row_width, amax, nz, nan);
+        }
+        for (int il_dbg = 0; il_dbg < (int) lctx.dflash.kv.k_ctx_cache.size(); ++il_dbg) {
+            ggml_tensor * kc = lctx.dflash.kv.k_ctx_cache[il_dbg];
+            if (kc == nullptr) { fprintf(stderr, "[dflash-geo] k_ctx_cache[%d] is null\n", il_dbg); continue; }
+            const int32_t row_width = (int32_t) kc->ne[0];
+            const size_t elem_size = (size_t) ggml_type_size(kc->type);
+            std::vector<float> row((size_t) row_width);
+            const int32_t slots_to_probe[5] = { 0, 1, 10, std::max(0, n_valid - 1), std::max(0, n_valid - 2) };
+            for (int p = 0; p < 5; ++p) {
+                const int32_t slot = slots_to_probe[p];
+                if (slot < 0 || slot >= cross_ctx) continue;
+                ggml_backend_tensor_get(kc, row.data(), (size_t) slot * (size_t) kc->nb[1], (size_t) row_width * (size_t) ggml_type_size(kc->type));
+                if (kc->type != GGML_TYPE_F32) {
+                    std::vector<ggml_fp16_t> h(row_width);
+                    ggml_backend_tensor_get(kc, h.data(), (size_t) slot * (size_t) kc->nb[1], (size_t) row_width * sizeof(ggml_fp16_t));
+                    for (int32_t i2 = 0; i2 < row_width; ++i2) row[(size_t) i2] = ggml_fp16_to_fp32(h[(size_t) i2]);
+                }
+                double sum = 0.0, amax = 0.0;
+                int32_t nz = 0, nan = 0;
+                for (int32_t i2 = 0; i2 < row_width; ++i2) {
+                    const double v = row[(size_t) i2];
+                    if (std::isnan(v) || std::isinf(v)) nan++;
+                    if (v != 0.0) nz++;
+                    sum += std::fabs(v);
+                    amax = std::max(amax, std::fabs(v));
+                }
+                fprintf(stderr, "[dflash-geo] k_ctx_cache[%d] slot=%d pos=%d meanabs=%.6g maxabs=%.6g nonzero=%d/%d nan=%d\n",
+                        il_dbg, slot, (int) lctx.dflash.target.pos_ctx_data[(size_t) slot],
+                        sum / (double) row_width, amax, nz, row_width, nan);
+            }
+        }
+
+        // Dump the draft tail rows (from the PREVIOUS draft decode): if the noise
+        // rows are identical to each other, the draft rope/positions are broken.
+        {
+            ggml_tensor * kc = lctx.dflash.kv.k_ctx_cache[0];
+            if (kc != nullptr) {
+                const int32_t row_width = (int32_t) kc->ne[0];
+                std::vector<std::vector<float>> rows;
+                for (int t = 0; t < (int) n_tokens; ++t) {
+                    std::vector<float> r((size_t) row_width);
+                    const int32_t slot = cross_ctx + t;
+                    ggml_backend_tensor_get(kc, r.data(), (size_t) slot * (size_t) kc->nb[1],
+                            (size_t) row_width * (size_t) ggml_type_size(kc->type));
+                    if (kc->type != GGML_TYPE_F32) {
+                        std::vector<ggml_fp16_t> h(row_width);
+                        ggml_backend_tensor_get(kc, h.data(), (size_t) slot * (size_t) kc->nb[1],
+                                (size_t) row_width * sizeof(ggml_fp16_t));
+                        for (int32_t i2 = 0; i2 < row_width; ++i2) r[(size_t) i2] = ggml_fp16_to_fp32(h[(size_t) i2]);
+                    }
+                    rows.push_back(std::move(r));
+                }
+                for (int t = 1; t < (int) n_tokens; ++t) {
+                    double diff = 0.0;
+                    for (int32_t i2 = 0; i2 < row_width; ++i2) {
+                        diff += std::fabs((double) rows[0][(size_t) i2] - (double) rows[t][(size_t) i2]);
+                    }
+                    fprintf(stderr, "[dflash-geo] tail row0 vs row%d absdiff=%.4g (row0[0]=%.4g)\n",
+                            t, diff, rows[0][0]);
+                }
+                for (int t = 0; t < (int) n_tokens; ++t) {
+                    double sum = 0.0, amax = 0.0;
+                    for (int32_t i2 = 0; i2 < row_width; ++i2) {
+                        sum += std::fabs((double) rows[t][(size_t) i2]);
+                        amax = std::max(amax, std::fabs((double) rows[t][(size_t) i2]));
+                    }
+                    fprintf(stderr, "[dflash-geo] tail row%d meanabs=%.4g maxabs=%.4g\n", t,
+                            sum / (double) row_width, amax);
+                }
+            }
+        }
+    }
+
     const size_t mask_elems = (size_t) n_kv_total * (size_t) n_mask_tokens;
     if (kq_mask == nullptr) {
         // all-SWA draft: the full mask was not created (no non-SWA layer consumes it); only the
@@ -750,6 +883,26 @@ bool llama_prepare_dflash_graph_inputs(
                 }
             }
             ggml_backend_tensor_set(kq_mask_swa, lctx.dflash.target.kq_mask_swa_data.data(), 0, ggml_nbytes(kq_mask_swa));
+        }
+    }
+
+    // TEMP-DEBUG (dspark): dump the POST-FILL mask rows
+    if (getenv("DSPARK_DUMP") && kq_mask_swa != nullptr) {
+        ggml_tensor * mk = kq_mask_swa;
+        std::vector<ggml_fp16_t> mrow((size_t) mk->ne[0]);
+        for (uint32_t j = 0; j < n_tokens && j < 2; ++j) {
+            ggml_backend_tensor_get(mk, mrow.data(), (size_t) j * (size_t) mk->nb[1],
+                    (size_t) mk->ne[0] * sizeof(ggml_fp16_t));
+            int32_t vis = 0, inf = 0, other = 0;
+            int32_t last_vis_slot = -1;
+            for (int32_t k = 0; k < (int32_t) mk->ne[0]; ++k) {
+                const float v = ggml_fp16_to_fp32(mrow[(size_t) k]);
+                if (v == 0.0f) { vis++; last_vis_slot = k; }
+                else if (std::isnan(v) || v == -INFINITY) inf++;
+                else other++;
+            }
+            fprintf(stderr, "[dflash-geo] mask row%d: visible=%d inf=%d other=%d last_vis_slot=%d\n",
+                    j, vis, inf, other, last_vis_slot);
         }
     }
 

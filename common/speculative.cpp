@@ -1382,6 +1382,10 @@ common_speculative * common_speculative_init(
             LOG_ERR("%s", "failed to create draft context\n");
             return nullptr;
         }
+        // TEMP-DEBUG (dspark): dump named tensors inside the draft graph
+        if (getenv("DSPARK_DUMP")) {
+            llama_set_dspark_debug(ctx_dft);
+        }
         if (has_dflash_stage) {
             dflash_cross_ctx = llama_get_dflash_visible_cross_ctx(ctx_dft);
             if (dflash_cross_ctx <= 0) {
@@ -2036,6 +2040,29 @@ bool common_speculative_load_draft_model(
         params_dft.offload_policy.clear();
         LOG_INF("%s: MTP draft ignores target CPU-MoE/tensor placement overrides\n",
                 __func__);
+    }
+
+    // An arch override (--override-kv general.architecture=...) is a statement about the
+    // TARGET's GGUF -- e.g. a V4.1 backbone relabelled to load under its own arch. The
+    // draft declares its own arch in its own header, so forcing the target's arch onto it
+    // makes the loader look for the target's KV keys and tensors inside the draft (observed:
+    // a dflash DSpark drafter loaded as deepseek41 -> "key not found: deepseek4.block_count").
+    // Drop only that one override for the draft; keep every other override.
+    //
+    // TODO(track A): remove this once the V4.1 GGUFs carry native `deepseek41.*` keys and
+    //   no longer need --override-kv general.architecture. It exists only to scope the
+    //   Track B arch-key substitution (see LLM_KV::operator() in llama-arch.cpp) away from
+    //   the draft model. With a properly relabelled backbone there is no arch override and
+    //   this block becomes dead code -- delete it then.
+    {
+        auto & ov = params_dft.kv_overrides;
+        const size_t before = ov.size();
+        ov.erase(std::remove_if(ov.begin(), ov.end(), [](const llama_model_kv_override & o) {
+            return o.key[0] != 0 && std::strcmp(o.key, "general.architecture") == 0;
+        }), ov.end());
+        if (ov.size() != before) {
+            LOG_INF("%s: draft model ignores the target's general.architecture override\n", __func__);
+        }
     }
 
     LOG_INF("%s: loading draft model '%s'\n", __func__, params_dft.model.c_str());

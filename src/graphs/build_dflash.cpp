@@ -95,7 +95,10 @@ ggml_tensor * llm_build_context::build_dspark_logits(
                 1,
                 base_logits->nb[1],
                 (size_t) i * base_logits->nb[1]);
-        ggml_tensor * biased_row = ggml_add(ctx0, base_row, markov_bias);
+        // TEMP-DEBUG (dspark): DSPARK_NOMARKOV=1 drafts from the base logits alone
+        ggml_tensor * biased_row = getenv("DSPARK_NOMARKOV")
+                ? base_row
+                : ggml_add(ctx0, base_row, markov_bias);
         ggml_tensor * token = ggml_argmax(ctx0, biased_row);
 
         chained = chained == nullptr ? biased_row : ggml_concat(ctx0, chained, biased_row, 1);

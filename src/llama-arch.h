@@ -54,6 +54,7 @@ enum llm_arch {
     LLM_ARCH_ARCTIC,
     LLM_ARCH_DEEPSEEK2,
     LLM_ARCH_DEEPSEEK4,
+    LLM_ARCH_DEEPSEEK41,
     LLM_ARCH_CHATGLM,
     LLM_ARCH_GLM4,
     LLM_ARCH_GLM4_MOE,
@@ -96,6 +97,16 @@ enum llm_arch {
     LLM_ARCH_LFM2,
     LLM_ARCH_UNKNOWN,
 };
+
+// DSV4 family: V4 and V4.1 share the compressed-KV (CSA/LID) cache machinery, its
+// speculative-decoding checkpoint plumbing, and the private per-context cache state
+// that seq_cp cannot copy. Use this helper for "is the DSV4 custom-cache path
+// active" checks. Where V4 and V4.1 genuinely differ, keep testing LLM_ARCH_DEEPSEEK4
+// explicitly -- notably the CSA overlap layout (llama-dsv4.cpp csa_overlap) and the
+// K-only window cache (llama.cpp is_dsv4_k_only).
+static inline bool llm_arch_is_dsv4(enum llm_arch arch) {
+    return arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41;
+}
 
 enum llm_kv {
     LLM_KV_GENERAL_TYPE,
@@ -217,6 +228,15 @@ enum llm_kv {
     LLM_KV_PLE_IMAGE_TOKEN_ID,
 
     LLM_KV_HASH_LAYER_COUNT,
+
+    LLM_KV_ENGRAM_HEAD_COUNT,
+    LLM_KV_ENGRAM_KEY_LENGTH,
+    LLM_KV_ENGRAM_LAYER_IDS,
+    LLM_KV_ENGRAM_MAX_NGRAM_SIZE,
+
+    LLM_KV_CANDIDATE_SOURCE_LAYER,
+    LLM_KV_CANDIDATE_BLOCK_SIZE,
+    LLM_KV_CANDIDATE_TOPK_BLOCKS,
 
     LLM_KV_ROPE_DIMENSION_COUNT,
     LLM_KV_ROPE_DIMENSION_COUNT_SWA,
@@ -524,6 +544,11 @@ enum llm_tensor {
     LLM_TENSOR_SHORTCONV_CONV,
     LLM_TENSOR_SHORTCONV_INPROJ,
     LLM_TENSOR_SHORTCONV_OUTPROJ,
+
+    LLM_TENSOR_ENGRAM_EMBD,
+    LLM_TENSOR_ENGRAM_K,
+    LLM_TENSOR_ENGRAM_Q,
+    LLM_TENSOR_ENGRAM_WKV,
 
     LLM_TENSOR_UNKNOWN,
 };
