@@ -1690,7 +1690,11 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
             //        "merged DSV4 MoE gate tensors use an unsupported layout");
             ggml_tensor * selected_experts = nullptr;
             ggml_tensor * exp_probs_b = model.layers[il].ffn_exp_probs_b;
-            if ((uint32_t) il < hparams.dsv4_hash_layer_count) {
+            const bool is_media = lctx.inp_embd != nullptr;
+            if (is_media && model.layers[il].ffn_exp_probs_b_vl != nullptr) {
+                // image tokens route through the vision bias instead of the hash path
+                exp_probs_b = model.layers[il].ffn_exp_probs_b_vl;
+            } else if ((uint32_t) il < hparams.dsv4_hash_layer_count) {
                 selected_experts = ggml_get_rows(ctx0, model.layers[il].ffn_gate_tid2eid, lctx.inp_tokens);
                 cb(selected_experts, "hashed_exps", il);
                 exp_probs_b = nullptr;
@@ -1821,7 +1825,8 @@ static ggml_tensor * dsv4_build_engram(
         float                eps,
         const llama_layer & layer,
         ggml_tensor       * lookup,
-        ggml_tensor       * h) {
+        ggml_tensor       * h,
+        ggml_tensor       * gate_mask) {
     const int64_t n_embd   = h->ne[0];
     const int64_t hc       = h->ne[1];
     const int64_t n_tokens = h->ne[2];
@@ -1848,6 +1853,16 @@ static ggml_tensor * dsv4_build_engram(
     // signed sqrt before the sigmoid, matching the training kernel
     ggml_tensor * mag  = ggml_sqrt(ctx0, ggml_clamp(ctx0, ggml_abs(ctx0, dot), 1e-6f, INFINITY));
     ggml_tensor * gate = ggml_sigmoid(ctx0, ggml_mul(ctx0, ggml_sgn(ctx0, dot), mag));
+
+    // VL: shut the gate at image-token positions (mask is 0 there, 1 elsewhere);
+    // when no mask was created (no image batch seen yet) it is null and the gate
+    // is unmasked -- matching the reference's text-only path. The mask input is a
+    // flat [n_tokens] vector; view it as [1, 1, n_tokens] so it broadcasts against
+    // the [1, hc, n_tokens] gate along the token axis (a flat [n_tokens] operand
+    // fails ggml_can_repeat: 1 % n_tokens != 0).
+    if (gate_mask != nullptr) {
+        gate = ggml_mul(ctx0, gate, ggml_reshape_3d(ctx0, gate_mask, 1, 1, n_tokens));
+    }
 
     // value: the last row-block of kv (rows hc*n_embd..(hc+1)*n_embd). It is a
     // strided view of kv, so it cannot be reshaped: build the repeated shape
@@ -1929,6 +1944,11 @@ ggml_cgraph * llm_build_context::build_deepseek41() {
     ggml_tensor * hc_carry_v = nullptr;
     ggml_tensor ** hc_carry = &hc_carry_v;
 
+    // engram gate mask (V4.1 VL): 0 at image-token positions, 1 elsewhere; the
+    // graph helper multiplies the gate by it (reference model.py Engram.forward
+    // masked_fill(~token_mask, 0)). Created lazily on the first engram layer.
+    ggml_tensor * engram_gate_mask = nullptr;
+
     for (int il = 0; il < n_layer_end; ++il) {
         auto & layer = model.layers[il];
 
@@ -1936,8 +1956,11 @@ ggml_cgraph * llm_build_context::build_deepseek41() {
         //      (llama-engram.cpp) produced the lookup input; project it to
         //      key/value and gate the value into the residual, BEFORE attention.
         if (lctx.engram.enabled && layer.engram_wkv != nullptr) {
+            if (engram_gate_mask == nullptr) {
+                engram_gate_mask = llama_engram_new_gate_mask(lctx, ctx0, n_tokens);
+            }
             ggml_tensor * inp_engram = llama_engram_new_lookup(lctx, ctx0, il, n_tokens);
-            inpL = dsv4_build_engram(ctx0, hparams.f_norm_rms_eps, layer, inp_engram, inpL);
+            inpL = dsv4_build_engram(ctx0, hparams.f_norm_rms_eps, layer, inp_engram, inpL, engram_gate_mask);
             cb(inpL, "engram_out", il);
         }
 
@@ -1974,7 +1997,10 @@ ggml_cgraph * llm_build_context::build_deepseek41() {
         cur = llm_build_norm(ctx0, cur, hparams, layer.ffn_norm, nullptr, LLM_NORM_RMS, cb, il);
         cb(cur, "ffn_norm", il);
 
-        ggml_tensor * exp_probs_b = layer.ffn_exp_probs_b;
+        const bool is_media = lctx.inp_embd != nullptr;
+        ggml_tensor * exp_probs_b = (is_media && layer.ffn_exp_probs_b_vl != nullptr)
+            ? layer.ffn_exp_probs_b_vl  // image tokens route through the vision bias
+            : layer.ffn_exp_probs_b;
         ggml_tensor * selected_experts = nullptr;
         ggml_tensor * moe_out = llm_build_moe_ffn(ctx0, lctx, cur,
                 layer.ffn_gate_inp, nullptr,

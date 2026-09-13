@@ -83,6 +83,10 @@ struct llama_engram_runtime {
     // graph build (llama_engram_new_lookup) and filled by llama_engram_prepare_inputs.
     std::vector<ggml_tensor *> lookup;
 
+    // F32 [n_tokens] graph input, 0 for image tokens (gate shut) and 1 elsewhere;
+    // created by llama_engram_new_gate_mask, filled by llama_engram_prepare_inputs.
+    ggml_tensor * gate_mask = nullptr;
+
     // per-sequence compressed-id history (see llama_engram_tail)
     std::unordered_map<llama_seq_id, llama_engram_tail> hist;
 
@@ -98,6 +102,11 @@ void llama_engram_init(llama_context & lctx);
 // Graph-build helper: create the F32 lookup input for engram layer `il` (block id)
 // and stash it on the context. Call once per engram layer per graph build.
 ggml_tensor * llama_engram_new_lookup(llama_context & lctx, ggml_context * ctx, uint32_t il, int64_t n_tokens);
+
+// Graph-build helper: create the [n_tokens] F32 gate-mask input (0 at image-token
+// positions) and stash it on the context. Call once per graph build, before the
+// engram layers; returns nullptr when engram is disabled.
+ggml_tensor * llama_engram_new_gate_mask(llama_context & lctx, ggml_context * ctx, int64_t n_tokens);
 
 // Per-batch fill: commit tokens to the per-seq history, hash all rows, prefetch,
 // then gather + dequant into the lookup inputs. Call after the graph build (or

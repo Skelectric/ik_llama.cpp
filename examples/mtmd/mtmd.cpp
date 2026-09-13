@@ -325,6 +325,11 @@ struct mtmd_context {
                 img_end = "<|media_end|>";
             }
         }
+        else if (proj == PROJECTOR_TYPE_DEEPSEEK4V) {
+            // markers are learned embeddings emitted by the encoder graph
+            img_beg = "";
+            img_end = "";
+        }
     }
 
     void init_audio() {
@@ -613,6 +618,10 @@ struct mtmd_tokenizer {
                 }
 
             } else {
+                // DeepSeek-V4.1: no lead-pad needed -- the token block is plain reading
+                // order and the V4.1 CSA2 compressor takes image tokens at arbitrary
+                // positions (per the reference image_processor.py, which has no alignment
+                // step). The V4-Exp lead-pad machinery is intentionally not ported.
                 size_t n_tokens = 0;
                 for (const auto & entry : batch_f32.entries) {
                     n_tokens += clip_n_output_tokens(ctx->ctx_v, entry.get());
@@ -864,6 +873,11 @@ float * mtmd_get_output_embd(mtmd_context * ctx) {
 
 bool mtmd_decode_use_non_causal(mtmd_context * ctx) {
     if (ctx->ctx_v) {
+        // NOTE: DeepSeek-V4.1 is deliberately NOT here: its reference forward is
+        // causal -- image_mask only selects the VL routing bias and the engram
+        // gate (model.py layer.forward: attn(x, start_pos) gets no image_mask), so
+        // image spans must be decoded with causal attention. The non-causal path
+        // is V4-Exp-only behavior from PR #2431 (re-add it there if ever needed).
         if (auto type = clip_get_projector_type(ctx->ctx_v); type == PROJECTOR_TYPE_GEMMA3 || type == PROJECTOR_TYPE_GEMMA4V) {
             return true;
         }

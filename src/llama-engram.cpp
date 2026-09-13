@@ -290,6 +290,18 @@ ggml_tensor * llama_engram_new_lookup(llama_context & lctx, ggml_context * ctx, 
     return t;
 }
 
+ggml_tensor * llama_engram_new_gate_mask(llama_context & lctx, ggml_context * ctx, int64_t n_tokens) {
+    auto & en = lctx.engram;
+    if (!en.enabled) {
+        return nullptr;
+    }
+    ggml_tensor * t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_tokens);
+    ggml_set_input(t);
+    ggml_set_name(t, "engram_gate_mask");
+    en.gate_mask = t;
+    return t;
+}
+
 bool llama_engram_prepare_inputs(llama_context & lctx, const llama_batch & ubatch) {
     auto & en = lctx.engram;
 
@@ -320,6 +332,12 @@ bool llama_engram_prepare_inputs(llama_context & lctx, const llama_batch & ubatc
     // so nothing can fault.
     en.rows.resize((size_t) n_el * n_tok * c.N_COLS);
 
+    // image tokens (the mtmd placeholder span) take no part in an n-gram and get
+    // no engram contribution: reference model.py:1261 engram_mask = ~image_mask and
+    // engram.py:166 compressed = where(mask, compressed, DEAD). Their own hash rows
+    // are pad-filled and they block the lookback of later tokens (DEAD in the tail).
+    constexpr llama_token DSV41_IMAGE_TOKEN_ID = 129264; // config.json image_token_id
+
     int32_t ids[c.N_GRAM];
 
     for (uint32_t i = 0; i < n_tok; ++i) {
@@ -329,7 +347,8 @@ bool llama_engram_prepare_inputs(llama_context & lctx, const llama_batch & ubatc
 
         GGML_ASSERT(token >= 0 && (uint32_t) token < c.n_vocab);
 
-        const int32_t cid = c.token_map[token];
+        const bool is_image = (token == DSV41_IMAGE_TOKEN_ID);
+        const int32_t cid = is_image ? c.DEAD : c.token_map[token];
 
         auto it = en.hist.find(seq);
         if (it == en.hist.end()) {
@@ -342,7 +361,7 @@ bool llama_engram_prepare_inputs(llama_context & lctx, const llama_batch & ubatc
             tail.v.fill(c.DEAD);
         }
 
-        ids[0] = cid; // text-only: the current token is never masked/DEAD
+        ids[0] = is_image ? c.pad_compressed : cid; // image tokens: pad-hash, DEAD in the tail
         bool blocked = false;
         for (uint32_t g = 1; g < c.N_GRAM; ++g) {
             const int32_t id = tail.v[g - 1];
@@ -440,6 +459,17 @@ bool llama_engram_prepare_inputs(llama_context & lctx, const llama_batch & ubatc
             fprintf(stderr, "\n");
             en.n_lookup_dumped++;
         }
+    }
+
+    // ---- gate mask: 0 at image-token positions (the engram passes them through),
+    // 1 elsewhere. The graph multiplies the gate by this input.
+    if (en.gate_mask != nullptr && en.gate_mask->ne[0] == (int64_t) n_tok) {
+        en.scratch.resize((size_t) n_tok);
+        float * m = en.scratch.data();
+        for (uint32_t i = 0; i < n_tok; ++i) {
+            m[i] = (ubatch.token[i] == DSV41_IMAGE_TOKEN_ID) ? 0.0f : 1.0f;
+        }
+        ggml_backend_tensor_set(en.gate_mask, m, 0, (size_t) n_tok * sizeof(float));
     }
 
     return true;
