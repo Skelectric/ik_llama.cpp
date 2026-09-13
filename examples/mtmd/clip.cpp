@@ -772,9 +772,10 @@ struct clip_graph {
     //
     // native-resolution ViT (RMSNorm, SwiGLU, 2D RoPE, no CLS / learned pos-embd)
     // then the "aligner": n_merge x n_merge patch merge (F.unfold == im2col) + 2-layer GELU MLP.
-    // the graph emits the full LLM token block: aligner output interleaved (N-layout) with
-    // 4 learned sentinels, reordered by a precomputed CPU layout_idx input:
-    //   [PAD]*lead_pad [START] <rows> [PAD]*pad_last [END]
+    // the graph emits the full LLM token block in plain reading order (the V4.1
+    // reference layout) with 3 learned sentinels -- no layout_idx reorder, no pads:
+    //   [START] + ([IMAGE]*n_llm_w + [NEWLINE])*n_llm_h + [END]
+    // (the V4-Exp N-layout + lead-pad variant from PR #2431 is NOT used for V4.1)
     // ref: inference/vision.py, inference/image_processor.py in the HF repo
     ggml_cgraph * build_deepseek4v() {
         const int n_merge = hparams.n_merge;
@@ -827,33 +828,37 @@ struct clip_graph {
             cb(cur, "aligner_out", -1);
         }
 
-        // assemble the token block: append the sentinel embeddings as extra rows
-        // then reorder everything with the precomputed layout index
+        // assemble the token block in plain reading order (DeepSeek-V4.1 reference
+        // layout, image_processor.py image_token_types):
+        //   [IMAGE_START] + ([IMAGE]*n_llm_w + [IMAGE_NEW_LINE]) * n_llm_h + [IMAGE_END]
+        // No pad sentinel, no lead-pad, no layout reorder (those are V4-Exp-specific).
         {
             const int64_t n_embd_out = cur->ne[0];
             const int64_t n_grid     = cur->ne[1]; // n_llm_w * n_llm_h
 
-            // rows n_grid + 0..3, keep in sync with the index computation in clip_image_batch_encode
-            ggml_tensor * sentinels[] = {
-                model.token_embd_img_start,
-                model.token_embd_img_end,
-                model.image_newline,
-                model.token_embd_img_pad,
-            };
-            for (ggml_tensor * tok : sentinels) {
-                cur = ggml_concat(ctx0, cur, ggml_reshape_2d(ctx0, tok, n_embd_out, 1), 1);
-            }
-
             const int n_llm_w = CLIP_ALIGN(n_patches_x, n_merge) / n_merge;
             const int n_llm_h = CLIP_ALIGN(n_patches_y, n_merge) / n_merge;
-            const int n_out   = dsv4_get_block_layout(n_llm_w, n_llm_h, img.lead_pad).n_out;
             GGML_ASSERT(n_grid == n_llm_w * n_llm_h);
 
-            ggml_tensor * layout_idx = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_out);
-            ggml_set_name(layout_idx, "layout_idx");
-            ggml_set_input(layout_idx);
+            // The aligner grid is [n_embd, n_llm_w, n_llm_h] with ne[1] = columns
+            // (x, fastest-varying in the patch order) and ne[2] = rows (y).
+            // Append one IMAGE_NEW_LINE column after the grid columns (dim 1):
+            //   [n_embd, n_llm_w, n_llm_h] x [n_embd, 1, n_llm_h] -> [n_embd, n_llm_w+1, n_llm_h]
+            // The reshape below then linearizes as p = col + row*(n_llm_w+1),
+            // i.e. plain reading order with the newline closing each row --
+            // matching the mtmd token stream. (The previous permute+concat-dim-2
+            // variant linearized column-major: transposed grid with all
+            // newlines bunched at the end.)
+            cur = ggml_reshape_3d(ctx0, cur, n_embd_out, n_llm_w, n_llm_h);
 
-            cur = ggml_get_rows(ctx0, cur, layout_idx);
+            ggml_tensor * newline = ggml_reshape_3d(ctx0, model.image_newline, n_embd_out, 1, 1);
+            newline = ggml_repeat(ctx0, newline, ggml_new_tensor_3d(ctx0, newline->type, n_embd_out, 1, n_llm_h));
+            cur = ggml_concat(ctx0, cur, newline, 1);
+
+            // [START] + rows + [END]
+            cur = ggml_reshape_2d(ctx0, cur, n_embd_out, n_llm_h * (n_llm_w + 1));
+            cur = ggml_concat(ctx0, ggml_reshape_2d(ctx0, model.token_embd_img_start, n_embd_out, 1), cur, 1);
+            cur = ggml_concat(ctx0, cur, ggml_reshape_2d(ctx0, model.token_embd_img_end, n_embd_out, 1), 1);
         }
 
         // build the graph
@@ -3439,6 +3444,11 @@ struct clip_model_loader {
                 int idx_std  = gguf_find_key(ctx_gguf.get(), KEY_IMAGE_STD);
                 GGML_ASSERT(idx_mean >= 0 && "image_mean not found");
                 GGML_ASSERT(idx_std >= 0  && "image_std not found");
+                // must be per-channel arrays: reading 3 elements from a shorter
+                // array would pull adjacent metadata bytes into G/B mean/std
+                // (observed: std=0 -> inf pixels -> NaN embeddings)
+                GGML_ASSERT(gguf_get_arr_n(ctx_gguf.get(), idx_mean) == 3 && "image_mean must have 3 elements");
+                GGML_ASSERT(gguf_get_arr_n(ctx_gguf.get(), idx_std)  == 3 && "image_std must have 3 elements");
                 const float * mean_data = (const float *) gguf_get_arr_data(ctx_gguf.get(), idx_mean);
                 const float * std_data  = (const float *) gguf_get_arr_data(ctx_gguf.get(), idx_std);
                 for (int i = 0; i < 3; ++i) {
@@ -3523,8 +3533,21 @@ struct clip_model_loader {
                         hparams.rope_theta = 10000.0f;
                         get_u32(KEY_PROJ_SCALE_FACTOR, hparams.n_merge);
                         get_u32(KEY_IMAGE_MIN_PIXELS,  hparams.image_min_pixels);
+                        // V4-Exp: 384/8; V4.1 carries its own (1024 / no cap) as metadata
                         hparams.dsv4_max_n_token  = 384;
                         hparams.dsv4_max_wh_ratio = 8;
+                        {
+                            int32_t v = 0;
+                            get_u32("clip.vision.dsv4_max_n_token", v, false);
+                            if (v > 0) {
+                                hparams.dsv4_max_n_token = v;
+                            }
+                            v = 0;
+                            get_u32("clip.vision.dsv4_max_wh_ratio", v, false);
+                            if (v >= 0) {
+                                hparams.dsv4_max_wh_ratio = v; // 0 = disabled (V4.1: max_wh_ratio null)
+                            }
+                        }
                         const int patch_area = hparams.patch_size * hparams.patch_size * hparams.n_merge * hparams.n_merge;
                         // handle min/max token counts from CLI
                         if (hparams.custom_image_min_tokens > 0) {
@@ -4091,7 +4114,8 @@ struct clip_model_loader {
                     model.image_newline        = get_tensor(TN_IMAGE_NEWLINE_V); // deepseek4v mmproj uses the v. prefix
                     model.token_embd_img_start = get_tensor(TN_TOK_IMG_START);
                     model.token_embd_img_end   = get_tensor(TN_TOK_IMG_END);
-                    model.token_embd_img_pad   = get_tensor(TN_TOK_IMG_PAD);
+                    // V4-Exp has a 4th pad sentinel; V4.1's reading-order layout never uses one
+                    model.token_embd_img_pad   = get_tensor(TN_TOK_IMG_PAD, false);
                 } break;
             default:
                 GGML_ASSERT(false && "unknown projector type");
@@ -5174,7 +5198,8 @@ bool clip_image_preprocess(struct clip_ctx * ctx, const clip_image_u8 * img, str
         case PROJECTOR_TYPE_DEEPSEEK4V:
             {
                 // resize solver picks the largest size whose LLM token block fits max_n_token
-                // (port of load_image / safe_resize / solve_resize_ratio / grid_tokens)
+                // (DeepSeek-V4.1 reference: image_processor.py load_image / safe_resize /
+                // solve_resize_ratio / llm_grid; num_image_tokens = n_llm_h*(n_llm_w+1) + 2)
                 const int p           = params.patch_size;
                 const int r           = params.n_merge;
                 const int max_n_token = params.dsv4_max_n_token;
@@ -5183,62 +5208,53 @@ bool clip_image_preprocess(struct clip_ctx * ctx, const clip_image_u8 * img, str
                 struct grid_info {
                     int n_llm_h;
                     int n_llm_w;
-                    int n_tokens; // token count of the block (incl. newline/pad rows and start/end, excl. lead pads)
+                    int n_tokens; // token count of the block (start + grid + newlines + end)
                 };
 
-                // ref: grid_tokens()
+                // ref: llm_grid() + num_image_tokens()
                 auto grid_tokens = [](int best_height, int best_width, int patch_size, int r) -> grid_info {
                     grid_info g;
-                    g.n_llm_h = ((best_height / patch_size) + r - 1) / r;
-                    g.n_llm_w = ((best_width  / patch_size) + r - 1) / r;
-                    g.n_tokens = dsv4_get_block_layout(g.n_llm_w, g.n_llm_h, 0).n_out;
+                    g.n_llm_h = (int) std::ceil((double)(best_height / patch_size) / r);
+                    g.n_llm_w = (int) std::ceil((double)(best_width  / patch_size) / r);
+                    g.n_tokens = g.n_llm_h * (g.n_llm_w + 1) + 2;
                     return g;
                 };
 
-                // ref: solve_resize_ratio()
+                // ref: solve_resize_ratio(); returns the largest aspect-preserving pixel size
+                // (patch-aligned) whose token grid fits max_n_token
                 auto solve_resize_ratio = [](int height, int width, int p, int r, int max_n_token,
                                              int & best_height, int & best_width) {
                     const double ratio   = (double) height / width;
-                    const double max_w_f = std::sqrt((max_n_token - 2) / ratio + 0.25) - 0.5;
+                    const double max_w_f = std::sqrt((double)(max_n_token - 2) / ratio + 0.25) - 0.5;
                     const double max_h_f = max_w_f * ratio;
+                    const int    cell    = p * r;
                     if (max_w_f < 1.0) {
-                        const int max_w = 1;
-                        int max_h = (max_n_token - 2) / (max_w + 1);
-                        if (max_h % 2 == 1) {
-                            max_h -= 1;
-                        }
-                        best_width  = max_w * p * r;
-                        best_height = max_h * p * r;
-                    } else if (max_h_f < 2.0) {
-                        const int max_h = 2;
-                        // guard tiny budgets; cannot be hit with the current lower bound on max_n_token
-                        const int max_w = std::max(((max_n_token - 2) / max_h) - 1, 2);
-                        best_width  = max_w * p * r;
-                        best_height = max_h * p * r;
+                        // very tall: collapse to a single column
+                        best_height = ((max_n_token - 2) / 2) * cell;
+                        best_width  = cell;
+                    } else if (max_h_f < 1.0) {
+                        // very wide: collapse to a single row
+                        best_height = cell;
+                        best_width  = (max_n_token - 3) * cell;
                     } else {
                         const int max_w_i = (int) std::floor(max_w_f);
-                        int max_h_i = (int) std::floor(max_h_f);
-                        if (max_h_i % 2 == 1) {
-                            max_h_i -= 1;
-                        }
+                        const int max_h_i = (int) std::floor(max_h_f);
                         const double beta = std::min(
-                            (double) max_w_i * p * r / width,
-                            (double) max_h_i * p * r / height);
-                        best_width  = (int) std::floor(width  * beta / p) * p;
+                            (double) max_w_i * cell / width,
+                            (double) max_h_i * cell / height);
                         best_height = (int) std::floor(height * beta / p) * p;
+                        best_width  = (int) std::floor(width  * beta / p) * p;
                     }
                 };
 
-                // ref: safe_resize()
+                // ref: safe_resize() -- the reference solves once and asserts it fits
                 auto safe_resize = [&](int height, int width, int & best_height, int & best_width,
                                        int p, int r, int max_n_token) {
-                    max_n_token -= 4 - 1; // reserve room for the position-dependent lead pads (COMPRESS_PAD_TO - 1)
                     grid_info g = grid_tokens(best_height, best_width, p, r);
-                    int budget = max_n_token;
-                    while (g.n_tokens > max_n_token) {
-                        solve_resize_ratio(height, width, p, r, budget, best_height, best_width);
+                    if (g.n_tokens > max_n_token) {
+                        solve_resize_ratio(height, width, p, r, max_n_token, best_height, best_width);
                         g = grid_tokens(best_height, best_width, p, r);
-                        budget -= 1;
+                        GGML_ASSERT(g.n_tokens <= max_n_token && "resize solver failed to fit the token budget");
                     }
                 };
 
@@ -5508,7 +5524,7 @@ int clip_n_output_tokens(const struct clip_ctx * ctx, struct clip_image_f32 * im
                 const int out_patch_size = params.patch_size * params.n_merge;
                 const int n_llm_w = CLIP_ALIGN(img->nx, out_patch_size) / out_patch_size;
                 const int n_llm_h = CLIP_ALIGN(img->ny, out_patch_size) / out_patch_size;
-                n_patches = dsv4_get_block_layout(n_llm_w, n_llm_h, img->lead_pad).n_out;
+                n_patches = n_llm_h * (n_llm_w + 1) + 2; // [START] + rows + [END] (no lead pads)
             } break;
         default:
             GGML_ABORT("unsupported projector type");
@@ -5610,6 +5626,105 @@ bool clip_image_encode(struct clip_ctx * ctx, const int n_threads, clip_image_f3
     imgs.entries.push_back(std::move(img_copy));
 
     return clip_image_batch_encode(ctx, n_threads, &imgs, vec);
+}
+
+// ============================================================================
+// TEMP DEBUG (stage-2 NaN bisect): CLIP_NAN_SCAN=1 installs a sched eval callback
+// that inspects every node output and reports the FIRST node producing a
+// non-finite value, then stops the compute. Remove after the vision bug is fixed.
+// ============================================================================
+struct clip_nan_scan_state {
+    int  node_count = 0;
+    bool found      = false;
+};
+
+static int clip_nan_scan_callback(struct ggml_tensor * t, bool ask, void * user_data) {
+    auto * st = (clip_nan_scan_state *) user_data;
+    if (ask) {
+        if (st->found) {
+            return 0;
+        }
+        switch (t->type) {
+            case GGML_TYPE_F32:
+            case GGML_TYPE_F16:
+            case GGML_TYPE_BF16:
+                return 1;
+            default:
+                return 0;
+        }
+    }
+    if (st->found || t->buffer == nullptr) {
+        return !st->found;
+    }
+    if (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_BF16) {
+        return true;
+    }
+    const int64_t n_el = ggml_nelements(t);
+    if (n_el <= 0) {
+        return true;
+    }
+    const size_t nbytes = ggml_nbytes(t);
+    static std::vector<uint8_t> scratch;
+    scratch.resize(nbytes);
+    ggml_backend_tensor_get(t, scratch.data(), 0, nbytes);
+    // widen to F32 for uniform scanning
+    static std::vector<float> wide;
+    wide.resize(n_el);
+    if (t->type == GGML_TYPE_F32) {
+        memcpy(wide.data(), scratch.data(), nbytes);
+    } else if (t->type == GGML_TYPE_F16) {
+        const ggml_fp16_t * h = (const ggml_fp16_t *) scratch.data();
+        for (int64_t i = 0; i < n_el; ++i) {
+            wide[i] = ggml_fp16_to_fp32(h[i]);
+        }
+    } else { // BF16
+        const uint16_t * h = (const uint16_t *) scratch.data();
+        for (int64_t i = 0; i < n_el; ++i) {
+            wide[i] = ggml_bf16_to_fp32((ggml_bf16_t) h[i]);
+        }
+    }
+    const float * d = (const float *) wide.data();
+    int64_t first_bad = -1;
+    int64_t n_bad     = 0;
+    float   vmin      =  INFINITY;
+    float   vmax      = -INFINITY;
+    for (int64_t i = 0; i < n_el; ++i) {
+        const float x = d[i];
+        if (!std::isfinite(x)) {
+            ++n_bad;
+            if (first_bad < 0) {
+                first_bad = i;
+            }
+        } else {
+            if (x < vmin) vmin = x;
+            if (x > vmax) vmax = x;
+        }
+    }
+    const int idx = st->node_count++;
+    if (getenv("CLIP_NAN_SCAN_VERBOSE")) {
+        LOG_ERR("CLIP_NAN_SCAN: node #%d op=%s name='%s' type=%s ne=[%lld,%lld,%lld,%lld] n_bad=%lld range=[%g,%g]\n",
+                idx, ggml_op_name(t->op), t->name, ggml_type_name(t->type),
+                (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+                (long long) n_bad, vmin, vmax);
+    }
+    if (first_bad >= 0) {
+        st->found = true;
+        LOG_ERR("CLIP_NAN_SCAN: FIRST NON-FINITE at node #%d op=%s name='%s' type=%s "
+                "ne=[%lld,%lld,%lld,%lld] first_bad=%lld n_bad=%lld finite-range=[%g,%g]\n",
+                idx, ggml_op_name(t->op), t->name, ggml_type_name(t->type),
+                (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+                (long long) first_bad, (long long) n_bad, vmin, vmax);
+        const int64_t i0 = first_bad > 4 ? first_bad - 4 : 0;
+        const int64_t i1 = first_bad + 4 < n_el ? first_bad + 4 : n_el - 1;
+        std::string vals;
+        for (int64_t i = i0; i <= i1; ++i) {
+            vals += string_format("%s%g", i == first_bad ? " >>" : " ", d[i]);
+        }
+        LOG_ERR("CLIP_NAN_SCAN:   values[%lld..%lld]:%s\n", (long long) i0, (long long) i1, vals.c_str());
+        return false; // stop the compute
+    }
+    if (idx < 0 && vmax >= -INFINITY) { /* keep the range vars used */ }
+    return true;
 }
 
 bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_image_f32_batch * imgs_c_ptr, float * vec) {
@@ -6000,45 +6115,9 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
                 }
                 set_input_i32("positions", positions);
 
-                // token block layout index (see build_deepseek4v)
-                // rows [0, n_grid) are the aligner output, the sentinels follow
-                const int n_merge = hparams.n_merge;
-                const int n_llm_w = CLIP_ALIGN(pos_w, n_merge) / n_merge;
-                const int n_llm_h = CLIP_ALIGN(pos_h, n_merge) / n_merge;
-                const int n_grid  = n_llm_w * n_llm_h;
-                const int idx_start   = n_grid;
-                const int idx_end     = n_grid + 1;
-                const int idx_newline = n_grid + 2;
-                const int idx_pad     = n_grid + 3;
-
-                const int lead_pad = imgs.entries[0]->lead_pad;
-                const auto bl = dsv4_get_block_layout(n_llm_w, n_llm_h, lead_pad);
-
-                std::vector<int32_t> idx;
-                idx.reserve(bl.n_out);
-                for (int i = 0; i < lead_pad; i++) {
-                    idx.push_back(idx_pad);
-                }
-                idx.push_back(idx_start);
-                // adjacent rows interleaved column-wise ("N-layout"); ref: build_image_block
-                for (int t = 0; t < bl.rows * bl.row_len; t++) {
-                    const int g   = t / (2 * bl.row_len);
-                    const int rem = t % (2 * bl.row_len);
-                    const int c   = rem / 2; // column
-                    const int r   = 2 * g + rem % 2; // row
-                    if (r >= n_llm_h) {
-                        idx.push_back(idx_pad);
-                    } else if (c == n_llm_w) {
-                        idx.push_back(idx_newline);
-                    } else {
-                        idx.push_back(r * n_llm_w + c);
-                    }
-                }
-                for (int i = 0; i < bl.pad_last; i++) {
-                    idx.push_back(idx_pad);
-                }
-                idx.push_back(idx_end);
-                set_input_i32("layout_idx", idx);
+                // DeepSeek-V4.1: the token block is assembled in-graph in plain reading
+                // order ([START] + ([IMAGE]*w + [NEWLINE])*h + [END]) -- no layout_idx
+                // input, no lead pads (the V4-Exp N-layout machinery is not used).
             } break;
         default:
             GGML_ABORT("Unknown projector type");
@@ -6057,10 +6136,26 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
     //    }
     //}
 
+    // TEMP DEBUG (stage-2 NaN bisect): optional first-non-finite node scan
+    static clip_nan_scan_state g_nan_scan_state;
+    if (getenv("CLIP_NAN_SCAN")) {
+        g_nan_scan_state.node_count = 0;
+        g_nan_scan_state.found      = false;
+        ggml_backend_sched_set_eval_callback(ctx->sched.get(), clip_nan_scan_callback, &g_nan_scan_state);
+    } else {
+        ggml_backend_sched_set_eval_callback(ctx->sched.get(), nullptr, nullptr);
+    }
+
     auto status = ggml_backend_sched_graph_compute(ctx->sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LOG_ERR("%s: ggml_backend_sched_graph_compute failed with error %d\n", __func__, status);
         return false;
+    }
+    if (getenv("CLIP_NAN_SCAN")) {
+        ggml_backend_sched_set_eval_callback(ctx->sched.get(), nullptr, nullptr);
+        if (!g_nan_scan_state.found) {
+            LOG_ERR("CLIP_NAN_SCAN: no non-finite values in %d F32 nodes\n", g_nan_scan_state.node_count);
+        }
     }
 
     // the last node is the embedding tensor
