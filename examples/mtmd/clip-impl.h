@@ -144,11 +144,13 @@
 // align x to upper multiple of n
 #define CLIP_ALIGN(x, n) ((((x) + (n) - 1) / (n)) * (n))
 
-// deepseek4v: layout of the LLM token block built from the aligner grid
+// deepseek4v: layout of the LLM token block built from the aligner grid.
+// DeepSeek-V4.1 reference layout is plain reading order (no lead pads, no pad
+// sentinel, no reorder): [START] + ([IMAGE]*w + [NEWLINE])*h + [END].
 struct dsv4_block_layout {
-    int rows;     // grid rows, padded to an even count
+    int rows;     // grid rows, padded to an even count (V4-Exp N-layout only)
     int row_len;  // grid width + 1 newline
-    int pad_last; // trailing pads
+    int pad_last; // trailing pads (V4-Exp only)
     int n_out;    // total block size, including lead pads and the start/end sentinels
 };
 static inline dsv4_block_layout dsv4_get_block_layout(int n_llm_w, int n_llm_h, int lead_pad) {
@@ -250,7 +252,8 @@ struct clip_image_f32 {
 
     std::vector<float> buf;
 
-    // deepseek4v: leading IMAGE_PAD embeddings, aligns IMAGE_START to the compressor boundary
+    // deepseek4v (V4-Exp only): leading IMAGE_PAD embeddings; V4.1's reading-order
+    // layout never sets this (stays 0)
     int32_t lead_pad = 0;
 };
 

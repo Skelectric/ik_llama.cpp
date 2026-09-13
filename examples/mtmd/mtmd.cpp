@@ -618,15 +618,10 @@ struct mtmd_tokenizer {
                 }
 
             } else {
-                if (ctx->proj_type_v() == PROJECTOR_TYPE_DEEPSEEK4V) {
-                    // align the image block to the 4-token CSA compress boundary
-                    constexpr int32_t align = 4;
-                    size_t n_past = 0;
-                    for (const auto & e : cur.entries) {
-                        n_past += mtmd_input_chunk_get_n_tokens(&e);
-                    }
-                    batch_f32.entries[0]->lead_pad = align - 1 - (int32_t)(n_past % align);
-                }
+                // DeepSeek-V4.1: no lead-pad needed -- the token block is plain reading
+                // order and the V4.1 CSA2 compressor takes image tokens at arbitrary
+                // positions (per the reference image_processor.py, which has no alignment
+                // step). The V4-Exp lead-pad machinery is intentionally not ported.
                 size_t n_tokens = 0;
                 for (const auto & entry : batch_f32.entries) {
                     n_tokens += clip_n_output_tokens(ctx->ctx_v, entry.get());
@@ -878,7 +873,12 @@ float * mtmd_get_output_embd(mtmd_context * ctx) {
 
 bool mtmd_decode_use_non_causal(mtmd_context * ctx) {
     if (ctx->ctx_v) {
-        if (auto type = clip_get_projector_type(ctx->ctx_v); type == PROJECTOR_TYPE_GEMMA3 || type == PROJECTOR_TYPE_GEMMA4V || type == PROJECTOR_TYPE_DEEPSEEK4V) {
+        // NOTE: DeepSeek-V4.1 is deliberately NOT here: its reference forward is
+        // causal -- image_mask only selects the VL routing bias and the engram
+        // gate (model.py layer.forward: attn(x, start_pos) gets no image_mask), so
+        // image spans must be decoded with causal attention. The non-causal path
+        // is V4-Exp-only behavior from PR #2431 (re-add it there if ever needed).
+        if (auto type = clip_get_projector_type(ctx->ctx_v); type == PROJECTOR_TYPE_GEMMA3 || type == PROJECTOR_TYPE_GEMMA4V) {
             return true;
         }
     }
