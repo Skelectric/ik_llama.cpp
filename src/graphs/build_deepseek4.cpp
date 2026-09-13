@@ -1218,10 +1218,13 @@ static ggml_tensor * ds4_attention(ggml_cgraph * gf, ggml_context * ctx0, llm_bu
         auto q = llm.llm_build_lora_mm(llm.lctx, ctx0, wq, qin);
         cb(q, (tag + "_b").c_str(), il);
         q = ggml_reshape_2d(ctx0, q, n_embd_head, nhead * n_tokens);
-        // V4 per-head-normalizes q after wq_b; V4.1 does NOT. The norm tensor is
-        // null for V4.1, but llm_build_norm still applies an RMS norm even with a
-        // null weight tensor, so it must be skipped explicitly for DEEPSEEK41.
-        if (model.arch == LLM_ARCH_DEEPSEEK4) {
+        // V4 per-head-normalizes q after wq_b; V4.1 does NOT (reference model.py has no
+        // per-head q norm). The norm tensor is null for V4.1's q, but llm_build_norm still
+        // applies an RMS norm even with a null weight tensor, so q's norm must be skipped
+        // explicitly for DEEPSEEK41. The kv latent, however, IS normed on BOTH arches
+        // (reference: kv = kv_norm(wkv(x)), model.py:704) -- attn_kv_norm aliases
+        // attn_kv_a_norm for DEEPSEEK41 (llama-load-tensors.cpp) and is always non-null.
+        if (model.arch == LLM_ARCH_DEEPSEEK4 || tag == "kv") {
             q = llm.llm_build_norm(ctx0, q, hparams, norm, nullptr, LLM_NORM_RMS, cb, il);
             cb(q, (tag + "_norm").c_str(), il);
         }

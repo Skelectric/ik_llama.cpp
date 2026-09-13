@@ -263,6 +263,7 @@ void llama_engram_init(llama_context & lctx) {
     en.hist.clear();
     en.enabled = true;
 
+    en.dump = getenv("LLAMA_ENGRAM_DUMP") != nullptr;
     LLAMA_LOG_INFO("engram: %zu layer(s) initialized from %s\n", en.c.layers.size(), sidecar.c_str());
 }
 
@@ -354,6 +355,21 @@ bool llama_engram_prepare_inputs(llama_context & lctx, const llama_batch & ubatc
             llama_engram_hash_row(c, e, ids, en.rows.data() + ((size_t) e * n_tok + i) * c.N_COLS);
         }
 
+        // debug dump (LLAMA_ENGRAM_DUMP=1): token ids + computed rows for cross-checking
+        if (en.dump && en.n_dumped < 64) {
+            fprintf(stderr, "ENGDUMP pos=%d tok=%d cid=%d", (int) pos, (int) token, (int) cid);
+            for (uint32_t e = 0; e < n_el; ++e) {
+                const uint32_t * r = en.rows.data() + ((size_t) e * n_tok + i) * c.N_COLS;
+                fprintf(stderr, " L%d=[", (int) c.layers[e].layer_id);
+                for (uint32_t j = 0; j < c.N_COLS; ++j) {
+                    fprintf(stderr, "%s%u", j ? "," : "", r[j]);
+                }
+                fprintf(stderr, "]");
+            }
+            fprintf(stderr, "\n");
+            en.n_dumped++;
+        }
+
         // shift: the tail becomes {cid, old[0], old[1]}
         for (uint32_t g = c.N_GRAM - 1; g > 1; --g) {
             tail.v[g - 1] = tail.v[g - 2];
@@ -407,6 +423,23 @@ bool llama_engram_prepare_inputs(llama_context & lctx, const llama_batch & ubatc
         }
 
         ggml_backend_tensor_set(en.lookup[e], dst, 0, (size_t) c.ROW_ELEMS * n_tok * sizeof(float));
+
+        // debug dump: first token's dequantized rows, hex floats, for file-read cross-check
+        if (en.dump && en.n_lookup_dumped < 2) {
+            const uint32_t * r0 = en.rows.data() + ((size_t) e * n_tok + 0) * c.N_COLS;
+            fprintf(stderr, "ENGDUMPLK e=%u tok0_rows", e);
+            for (uint32_t col = 0; col < c.N_COLS; ++col) {
+                fprintf(stderr, " %u", r0[col]);
+            }
+            fprintf(stderr, "\nENGDUMPLK e=%u tok0_vals", e);
+            const float * v = dst;
+            for (uint32_t k = 0; k < c.ROW_ELEMS; ++k) {
+                union { float f; uint32_t u; } x; x.f = v[k];
+                fprintf(stderr, " %08x", x.u);
+            }
+            fprintf(stderr, "\n");
+            en.n_lookup_dumped++;
+        }
     }
 
     return true;

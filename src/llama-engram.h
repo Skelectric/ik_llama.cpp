@@ -72,6 +72,11 @@ struct llama_engram_tail {
 struct llama_engram_runtime {
     bool enabled = false;
 
+    // debug: dump per-token hash rows to stderr (LLAMA_ENGRAM_DUMP=1)
+    bool     dump     = false;
+    uint32_t n_dumped = 0;
+    uint32_t n_lookup_dumped = 0;
+
     llama_engram_constants c;
 
     // F32 [ROW_ELEMS, n_tokens] graph input per engram layer, created during each

@@ -1830,7 +1830,12 @@ bool llama_prepare_dsv4_graph_inputs(llama_context & lctx, const llama_batch & b
     const uint32_t lid_ratio = lctx.model.hparams.dsv4_lid_ratio;
     lctx.dsv4.csa_plan = build_plan(csa_ratio, csa_overlap, csa_state_size, csa_kv_size, cache_n_stream);
     lctx.dsv4.hca_plan = build_plan(hca_ratio, false, hca_state_size, hca_kv_size, cache_n_stream);
-    lctx.dsv4.lid_plan = build_plan(lid_ratio, false, lid_state_size, lid_kv_size, cache_n_stream);
+    // The LID plan's overlap must match the LID graph build (ds4_build_comp for the
+    // lid group passes overlap = arch==DEEPSEEK4): with overlap the plan emits
+    // 2*ratio read idxs per block (prev + cur window) to feed the type-0 comp.
+    // For V4.1 the lid plan's read idxs are unused (index keys come from the csa
+    // plan's state_write_idxs_lid), so the flag is inert there.
+    lctx.dsv4.lid_plan = build_plan(lid_ratio, csa_overlap, lid_state_size, lid_kv_size, cache_n_stream);
     lctx.dsv4.csa_ctx = dsv4_build_comp_context(batch, cache_n_stream, lctx.dsv4.csa_plan.n_kv);
     lctx.dsv4.hca_ctx = dsv4_build_comp_context(batch, cache_n_stream, lctx.dsv4.hca_plan.n_kv);
     lctx.dsv4.lid_ctx = dsv4_build_comp_context(batch, cache_n_stream, lctx.dsv4.lid_plan.n_kv);
