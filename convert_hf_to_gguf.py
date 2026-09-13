@@ -47,6 +47,10 @@ AnyModel = TypeVar("AnyModel", bound="type[Model]")
 class Model:
     _model_classes: dict[str, type[Model]] = {}
     mtp_only = False
+    # subclasses may set this to keep int8/float8 tensors at their source dtype
+    # (base prepare_tensors would otherwise coerce them to float32, corrupting
+    # bit-packed weights); they must then convert to float32 themselves
+    keep_source_dtypes = False
 
     dir_model: Path
     ftype: gguf.LlamaFileType
@@ -93,7 +97,7 @@ class Model:
             self.part_names = Model.get_model_part_names(self.dir_model, "pytorch_model", ".bin")
             if len(self.part_names) == 0:
                 self.part_names = Model.get_model_part_names_from_weight_map(self.dir_model, "pytorch_model.bin.index.json")
-        self.hparams = Model.load_hparams(self.dir_model)
+        self.hparams = type(self).load_hparams(self.dir_model)
         self.block_count = self.find_hparam(["n_layers", "num_hidden_layers", "n_layer", "num_layers"])
         self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
         self.tensor_names = None
@@ -280,7 +284,7 @@ class Model:
             old_dtype = data_torch.dtype
 
             # convert any unsupported data types to float32
-            if data_torch.dtype not in (torch.float16, torch.float32) and not self.mtp_only:
+            if data_torch.dtype not in (torch.float16, torch.float32) and not self.mtp_only and not self.keep_source_dtypes:
                 data_torch = data_torch.to(torch.float32)
 
             # use the first number-like part of the tensor name as the block id
@@ -5340,6 +5344,390 @@ class DeepseekV4Model(DeepseekV2Model):
             self.gguf_writer.add_attention_indexer_top_k(indexer_top_k)
         if (nextn_layers := self.hparams.get("num_nextn_predict_layers")) is not None:
             self.gguf_writer.add_nextn_predict_layers(nextn_layers)
+
+
+@Model.register("DeepseekV41ForCausalLM")
+class DeepseekV41Model(DeepseekV4Model):
+    """DeepSeek-V4.1-Flash conversion (port of upstream llama.cpp PR #28696).
+
+    Emits a deepseek4-arch GGUF. Conversion only for now: the current DeepSeek4
+    runtime graph requires output_hc_fn/base/scale, which V4.1 does not ship.
+
+    Differences from V4 handled here:
+      * text parameters are nested under text_config (promoted in load_hparams)
+      * num_hash_layers is absent (the V4 metadata path reads it unconditionally)
+      * the FP8 scale block size is [32, 32] rather than V4's [128, 128]
+      * engram conditional-memory tensors, with a chunked Q8_0 write for the
+        384M-row embedding tables (too large for the streaming flow)
+      * indexer k_norm and wk map to the existing INDEXER_K_NORM / INDEXER_ATTN_K
+      * attn.compressor.ape and attn.indexer.compressor.* are absent
+      * rope_scaling uses "rope_type" (transformers v5) and carries no
+        mscale_all_dim, so the inherited V2 yarn branch never fires; the yarn
+        keys are written here explicitly
+      * the vision tower / aligner are skipped (separate mmproj export)
+      * DSpark (mtp.*) draft blocks are skipped (dedicated export later)
+    """
+    model_arch = gguf.MODEL_ARCH.DEEPSEEK4
+    # I8-packed MXFP4 experts and E8M0/FP8 scales must reach modify_tensors with
+    # their source dtypes intact; this class converts what it needs itself.
+    keep_source_dtypes = True
+
+    _ENGRAM_CHUNK_ROWS = 1_000_000  # rows per pass over an engram table (~1 GB fp32 scratch)
+
+    _V41_ROOT_NAMES: dict[str, str] = {
+        "embed.weight": "token_embd.weight",
+        "norm.weight":  "output_norm.weight",
+        "head.weight":  "output.weight",
+    }
+
+    # Explicit source -> GGUF names matching the fork C++ llama-model.cpp
+    # DEEPSEEK4 block. tensor_map is bypassed entirely: the TENSOR_NAMES table
+    # has a silent duplicate-key collision where the openPangu block overrides
+    # the DeepSeek indexer names.
+    _V41_LAYER_NAMES: dict[str, str] = {
+        "attn_norm.weight":                  "attn_norm.weight",
+        "ffn_norm.weight":                   "ffn_norm.weight",
+        "attn.attn_sink":                    "attn_sinks.weight",
+        "attn.wq_a.weight":                  "attn_q_a.weight",
+        "attn.wq_b.weight":                  "attn_q_b.weight",
+        "attn.q_norm.weight":                "attn_q_a_norm.weight",
+        "attn.wkv.weight":                   "attn_kv.weight",
+        "attn.kv_norm.weight":               "attn_kv_a_norm.weight",
+        "attn.wo_a.weight":                  "attn_output_a.weight",
+        "attn.wo_b.weight":                  "attn_output_b.weight",
+        "attn.compressor.wkv.weight":        "attn_compressor_kv.weight",
+        "attn.compressor.wgate.weight":      "attn_compressor_gate.weight",
+        "attn.compressor.norm.weight":       "attn_compressor_norm.weight",
+        "attn.indexer.wq_b.weight":          "indexer.attn_q_b.weight",
+        "attn.indexer.weights_proj.weight":  "indexer.proj.weight",
+        "attn.indexer.wk.weight":            "indexer.attn_k.weight",
+        "attn.indexer.k_norm.weight":        "indexer.k_norm.weight",
+        "ffn.gate.weight":                   "ffn_gate_inp.weight",
+        "ffn.gate.bias":                     "exp_probs_b.bias",
+        "ffn.gate.bias_vl":                  "exp_probs_b_vl.bias",
+        "ffn.shared_experts.w1.weight":      "ffn_gate_shexp.weight",
+        "ffn.shared_experts.w2.weight":      "ffn_down_shexp.weight",
+        "ffn.shared_experts.w3.weight":      "ffn_up_shexp.weight",
+        "hc_attn_base":                      "hc_attn_base.weight",
+        "hc_attn_fn":                        "hc_attn_fn.weight",
+        "hc_attn_scale":                     "hc_attn_scale.weight",
+        "hc_ffn_base":                       "hc_ffn_base.weight",
+        "hc_ffn_fn":                         "hc_ffn_fn.weight",
+        "hc_ffn_scale":                      "hc_ffn_scale.weight",
+        "engram.k_weight":                   "engram_k.weight",
+        "engram.q_weight":                   "engram_q.weight",
+        "engram.wkv.weight":                 "engram_wkv.weight",
+    }
+
+    _V41_EXPERT_PROJ_NAMES = {
+        "1": "ffn_gate_exps.weight",
+        "2": "ffn_down_exps.weight",
+        "3": "ffn_up_exps.weight",
+    }
+
+    @staticmethod
+    def load_hparams(dir_model: Path) -> dict[str, Any]:
+        with open(dir_model / "config.json", "r", encoding="utf-8") as f:
+            hparams = json.load(f)
+        # V4.1 nests the text parameters under text_config; the inherited
+        # V4/V2 code expects them at the top level.
+        for key, value in (hparams.get("text_config") or {}).items():
+            hparams.setdefault(key, value)
+        # absent in V4.1; the V4 metadata path reads it
+        hparams.setdefault("num_hash_layers", 0)
+        # transformers v5 renamed rope_scaling "type" to "rope_type"
+        rope_scaling = hparams.get("rope_scaling")
+        if isinstance(rope_scaling, dict) and "type" not in rope_scaling and "rope_type" in rope_scaling:
+            rope_scaling["type"] = rope_scaling["rope_type"]
+        return hparams
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # V4.1 tiles FP8 weights with [32, 32] blocks where V4 used [128, 128].
+        # The dequant below derives the tiling from the actual scale shapes, so
+        # this is validation only - but reusing V4's hardcoded 128 would
+        # silently rescale every dequantized weight, so make it loud.
+        quant_cfg = self.hparams.get("quantization_config") or {}
+        block = quant_cfg.get("weight_block_size") or [128, 128]
+        self._v41_block_rows = int(block[0])
+        self._v41_block_cols = int(block[1] if len(block) > 1 else block[0])
+        if (self._v41_block_rows, self._v41_block_cols) != (32, 32):
+            logger.warning(
+                "DeepSeek-V4.1: unexpected fp8 weight_block_size %dx%d (expected 32x32)",
+                self._v41_block_rows, self._v41_block_cols,
+            )
+
+        # The main-model export covers the backbone layers only: DSpark (mtp.*)
+        # is a separate draft export, unlike V4 where nextn layers were blocks.
+        self.block_count = int(self.hparams["num_hidden_layers"])
+        self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+        self._v41_engram_layers = [int(b) for b in (self.hparams.get("engram_layer_ids") or [])]
+        logger.info(
+            "DeepSeek-V4.1: %d backbone layers, fp8 block %dx%d, engram layers %s",
+            self.block_count, self._v41_block_rows, self._v41_block_cols, self._v41_engram_layers,
+        )
+
+        # tensors that carry a sibling .scale in the checkpoint (fp8 pairing)
+        index_path = self.dir_model / "model.safetensors.index.json"
+        if index_path.is_file():
+            with open(index_path, "r", encoding="utf-8") as f:
+                weight_map = json.load(f).get("weight_map") or {}
+            self._v41_expected_scales = {
+                n[:-len(".scale")] + ".weight" for n in weight_map if n.endswith(".scale")
+            }
+        else:
+            self._v41_expected_scales = set()
+
+        self._v41_scales: dict[str, Tensor] = {}
+        self._v41_pending_weights: dict[str, Tensor] = {}
+        self._v41_experts: dict[tuple[int, str], dict[int, Tensor]] = {}
+        self._v41_fp8_dequantized: set[str] = set()
+        self._v41_bf16_tensors: set[str] = set()
+        self._v41_f32_tensors: set[str] = set()
+
+    def _v41_skip_tensor(self, name: str) -> bool:
+        # vision tower / aligner: separate mmproj export; DSpark: separate draft export
+        if name.startswith(("vision.", "aligner.", "image_", "mtp.")):
+            return True
+        # engram embedding tables are far too large for the streaming flow;
+        # _v41_write_engram_table handles them in row chunks
+        if re.match(r"layers\.\d+\.engram\.embed\.(weight|scale)$", name):
+            return True
+        return False
+
+    def get_tensors(self) -> Iterator[tuple[str, Tensor]]:
+        for name, data_torch in super().get_tensors():
+            if self._v41_skip_tensor(name):
+                continue
+            yield name, data_torch
+
+    def _v41_map_name(self, name: str, bid: int | None) -> str:
+        if name in self._V41_ROOT_NAMES:
+            return self._V41_ROOT_NAMES[name]
+        match = re.match(r"layers\.(\d+)\.(.+)$", name)
+        if match is None or match.group(2) not in self._V41_LAYER_NAMES:
+            raise ValueError(f"Unsupported DeepSeek-V4.1 tensor {name!r}")
+        layer = int(match.group(1))
+        if bid is not None and bid != layer:
+            raise ValueError(f"Tensor {name!r} has block id {bid}, expected {layer}")
+        return f"blk.{layer}." + self._V41_LAYER_NAMES[match.group(2)]
+
+    @staticmethod
+    def _v41_e8m0_to_float(scale: Tensor) -> Tensor:
+        torch_float8_e8m0 = getattr(torch, "float8_e8m0fnu", None)
+        if torch_float8_e8m0 is not None and scale.dtype == torch_float8_e8m0:
+            return scale.float()
+        bits = scale.view(torch.uint8).float()
+        return torch.exp2(bits - 127.0)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if self.mtp_only:
+            return super().modify_tensors(data_torch, name, bid)
+
+        expert_match = re.match(r"layers\.(\d+)\.ffn\.experts\.(\d+)\.w([123])\.(weight|scale)$", name)
+        is_scale = name.endswith(".scale")
+        weight_name = name.removesuffix(".scale") + ".weight" if is_scale else name
+
+        if expert_match is not None:
+            # MXFP4 experts: pair weight+scale, repack, and stream out each
+            # (layer, projection) stack as soon as all experts have arrived.
+            if is_scale:
+                self._v41_scales[weight_name] = data_torch
+                if weight_name not in self._v41_pending_weights:
+                    return []
+                weight = self._v41_pending_weights.pop(weight_name)
+            else:
+                if weight_name not in self._v41_scales:
+                    self._v41_pending_weights[weight_name] = data_torch
+                    return []
+                weight = data_torch
+            scale = self._v41_scales.pop(weight_name)
+            return self._v41_record_expert(weight_name, weight, scale)
+
+        if is_scale:
+            if weight_name not in self._v41_expected_scales:
+                raise ValueError(f"DeepSeek-V4.1: unexpected scale tensor {name!r}")
+            self._v41_scales[weight_name] = data_torch
+            if weight_name in self._v41_pending_weights:
+                # weight arrived first; complete the pair now
+                weight = self._v41_pending_weights.pop(weight_name)
+                self._v41_fp8_dequantized.add(weight_name)
+                return [(self._v41_map_name(weight_name, bid), self._dequantize_mtp_weight(weight, data_torch))]
+            return []
+
+        if weight_name in self._v41_expected_scales:
+            # FP8 weight: pair with its scale and dequantize to F32. The tiling
+            # is derived from the actual scale shapes, so V4.1's [32, 32]
+            # blocks and V4's [128, 128] blocks both work.
+            if weight_name not in self._v41_scales:
+                self._v41_pending_weights[weight_name] = data_torch
+                return []
+            scale = self._v41_scales.pop(weight_name)
+            self._v41_fp8_dequantized.add(weight_name)
+            return [(self._v41_map_name(weight_name, bid), self._dequantize_mtp_weight(data_torch, scale))]
+
+        # plain tensor: track the source dtype for tensor_force_quant, normalize to F32
+        dtype = data_torch.dtype
+        if dtype == torch.bfloat16:
+            self._v41_bf16_tensors.add(name)
+        elif dtype == torch.float32:
+            self._v41_f32_tensors.add(name)
+        if dtype not in (torch.float16, torch.float32):
+            data_torch = data_torch.to(torch.float32)
+        return [(self._v41_map_name(name, bid), data_torch)]
+
+    def _v41_record_expert(self, weight_name: str, weight: Tensor, scale: Tensor) -> Iterable[tuple[str, Tensor]]:
+        match = re.match(r"layers\.(\d+)\.ffn\.experts\.(\d+)\.w([123])\.weight$", weight_name)
+        assert match is not None
+        layer, expert, proj = int(match.group(1)), int(match.group(2)), match.group(3)
+
+        packed = self._pack_mxfp4_blocks(weight, scale)
+        key = (layer, proj)
+        self._v41_experts.setdefault(key, {})[expert] = packed
+
+        n_experts = int(self.hparams["n_routed_experts"])
+        if len(self._v41_experts[key]) < n_experts:
+            return []
+        experts = self._v41_experts.pop(key)
+        if set(experts) != set(range(n_experts)):
+            raise ValueError(f"Incomplete DeepSeek-V4.1 expert set for layer {layer}, projection w{proj}")
+
+        stacked = torch.stack([experts[eid] for eid in range(n_experts)], dim=0).contiguous()
+        new_name = f"blk.{layer}.{self._V41_EXPERT_PROJ_NAMES[proj]}"
+        self.gguf_writer.add_tensor(new_name, stacked.numpy(), raw_dtype=gguf.GGMLQuantizationType.MXFP4)
+        logger.info(f"{new_name}, MXFP4 experts {n_experts} x {tuple(stacked.shape[1:])}")
+        return []
+
+    def tensor_force_quant(self, name: str, new_name: str, bid: int | None, n_dims: int) -> gguf.GGMLQuantizationType | bool:
+        # Mirror the upstream V4.1 export: dequantized FP8 -> Q8_0, source
+        # BF16 -> BF16, source F32 -> F32 (1D is forced to F32 by the base).
+        if name in self._v41_fp8_dequantized and n_dims >= 2:
+            return gguf.GGMLQuantizationType.Q8_0
+        if name in self._v41_bf16_tensors and n_dims >= 2:
+            return gguf.GGMLQuantizationType.BF16
+        if name in self._v41_f32_tensors:
+            return gguf.GGMLQuantizationType.F32
+        return False
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        hparams = self.hparams
+        arch = gguf.MODEL_ARCH_NAMES[self.model_arch]
+
+        # upstream writes this unconditionally for DEEPSEEK4 (the fork's V4
+        # only writes it for MTP exports); keeps the file consistent with
+        # upstream-converted V4 GGUFs
+        self.gguf_writer.add_embedding_length_out(int(hparams["hidden_size"]) * int(hparams["hc_mult"]))
+
+        # The inherited V2 yarn branch requires mscale_all_dim, which V4.1 does
+        # not have, so it never fires; write the yarn keys explicitly instead.
+        rope_scaling = hparams.get("rope_scaling") or {}
+        if rope_scaling.get("type") == "yarn":
+            self.gguf_writer.add_string(f"{arch}.rope.scaling.type", "yarn")
+            self.gguf_writer.add_float32(f"{arch}.rope.scaling.factor", float(rope_scaling["factor"]))
+            self.gguf_writer.add_uint32(
+                f"{arch}.rope.scaling.original_context_length",
+                int(rope_scaling["original_max_position_embeddings"]),
+            )
+            self.gguf_writer.add_float32(f"{arch}.rope.scaling.yarn_beta_fast", float(rope_scaling.get("beta_fast", 32.0)))
+            self.gguf_writer.add_float32(f"{arch}.rope.scaling.yarn_beta_slow", float(rope_scaling.get("beta_slow", 1.0)))
+
+        if (engram_ids := hparams.get("engram_layer_ids")) is not None:
+            self.gguf_writer.add_uint32(f"{arch}.engram.head_count", int(hparams["engram_n_heads"]))
+            self.gguf_writer.add_uint32(f"{arch}.engram.key_length", int(hparams["engram_head_dim"]))
+            self.gguf_writer.add_uint32(f"{arch}.engram.max_ngram_size", int(hparams["engram_max_ngram_size"]))
+            self.gguf_writer.add_array(f"{arch}.engram.layer_ids", engram_ids)
+
+    def prepare_tensors(self):
+        super().prepare_tensors()
+
+        if self._v41_pending_weights:
+            raise ValueError(f"Unpaired DeepSeek-V4.1 weight scales: {sorted(self._v41_pending_weights)}")
+        if self._v41_scales:
+            raise ValueError(f"Unpaired DeepSeek-V4.1 scales: {sorted(self._v41_scales)}")
+        if self._v41_experts:
+            raise ValueError(f"Unprocessed DeepSeek-V4.1 experts: {sorted(self._v41_experts)}")
+
+        for bid in self._v41_engram_layers:
+            self._v41_write_engram_table(bid)
+
+    def _v41_write_engram_table(self, bid: int) -> None:
+        """Quantize one engram embedding table in row chunks, accumulating into
+        a disk-backed memmap that is handed to the GGUF writer.
+
+        One table is ~384M x 256 fp8 (~98 GB raw, ~393 GB as fp32), far too large
+        for the streaming flow. Rows are read straight from the safetensors
+        shard, dequantized and Q8_0-quantized per chunk. The engram scale layout
+        also differs from the linear weights: [rows, 8], one scale per 32
+        columns within a row, rather than the [rows/32, cols/32] tiling.
+        """
+        from safetensors import safe_open
+
+        weight_name = f"layers.{bid}.engram.embed.weight"
+        scale_name = f"layers.{bid}.engram.embed.scale"
+
+        index_path = self.dir_model / "model.safetensors.index.json"
+        with open(index_path, "r", encoding="utf-8") as f:
+            weight_map = json.load(f)["weight_map"]
+        shard_path = self.dir_model / weight_map[weight_name]
+
+        qtype = gguf.GGMLQuantizationType.Q8_0
+        block_elems = gguf.GGML_QUANT_SIZES[qtype][0]
+
+        with safe_open(str(shard_path), framework="pt") as f:
+            weight_slice = f.get_slice(weight_name)
+            n_rows, n_cols = (int(x) for x in weight_slice.get_shape())
+            has_scale = scale_name in f.keys()
+            scale_slice = f.get_slice(scale_name) if has_scale else None
+            scale_groups = int(scale_slice.get_shape()[1]) if has_scale else 0
+
+            if n_cols % block_elems:
+                raise ValueError(f"DeepSeek-V4.1 engram table has {n_cols} columns, not a multiple of {block_elems}")
+            if has_scale and (n_cols % scale_groups or int(scale_slice.get_shape()[0]) != n_rows):
+                raise ValueError(
+                    f"DeepSeek-V4.1 engram scale shape {tuple(scale_slice.get_shape())} does not tile "
+                    f"a [{n_rows}, {n_cols}] table with {scale_groups} groups per row"
+                )
+            per_group = n_cols // scale_groups if has_scale else 0
+
+            row_bytes = gguf.quants.quantize(np.zeros((1, n_cols), dtype=np.float32), qtype).nbytes
+            rows_per_chunk = min(int(self._ENGRAM_CHUNK_ROWS), n_rows)
+
+            tmp_dir = os.environ.get("V41_ENGRAM_TMPDIR") or str(self.fname_out.parent)
+            os.makedirs(tmp_dir, exist_ok=True)
+            tmp_path = os.path.join(tmp_dir, f".{weight_name.replace('.', '_')}.q8_0.tmp")
+            logger.info(
+                f"DeepSeek-V4.1: quantizing engram table {weight_name} [{n_rows}, {n_cols}] to {qtype.name} "
+                f"({n_rows * row_bytes / 1e9:.1f} GB scratch at {tmp_path})"
+            )
+
+            out = np.memmap(tmp_path, dtype=np.uint8, mode="w+", shape=(n_rows, row_bytes))
+            try:
+                for start in range(0, n_rows, rows_per_chunk):
+                    stop = min(start + rows_per_chunk, n_rows)
+                    chunk = weight_slice[start:stop, :].float()
+                    if has_scale:
+                        scales = self._v41_e8m0_to_float(scale_slice[start:stop, :])
+                        chunk = chunk * scales.repeat_interleave(per_group, 1)[:, :n_cols]
+                    out[start:stop] = gguf.quants.quantize(
+                        chunk.cpu().numpy().astype(np.float32), qtype,
+                    ).reshape(stop - start, row_bytes)
+                    del chunk
+                    logger.info(f"DeepSeek-V4.1: engram {weight_name} rows {start}-{stop} of {n_rows}")
+                out.flush()
+            except BaseException:
+                del out
+                os.remove(tmp_path)
+                raise
+
+        try:
+            self.gguf_writer.add_tensor(f"blk.{bid}.engram_embd.weight", out, raw_dtype=qtype)
+        finally:
+            # the writer has streamed the bytes into its temp data file
+            del out
+            os.remove(tmp_path)
+
 
 @Model.register("OpenPanguV2ForCausalLM")
 class OpenPanguV2Model(DeepseekV2Model):

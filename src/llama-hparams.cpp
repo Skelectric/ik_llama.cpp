@@ -1891,6 +1891,7 @@ void llm_load_hparams(
             } break;
         case LLM_ARCH_DFLASH:
         case LLM_ARCH_DEEPSEEK4:
+        case LLM_ARCH_DEEPSEEK41:
         case LLM_ARCH_GLM_DSA:
             {
                 if (model.arch == LLM_ARCH_DFLASH) {
@@ -1936,7 +1937,7 @@ void llm_load_hparams(
                     model.type = e_model::MODEL_UNKNOWN;
                     break;
                 }
-                const bool is_dsv4 = model.arch == LLM_ARCH_DEEPSEEK4 || hparams.dflash_dsv4;
+                const bool is_dsv4 = model.arch == LLM_ARCH_DEEPSEEK4 || model.arch == LLM_ARCH_DEEPSEEK41 || hparams.dflash_dsv4;
                 ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.nextn_predict_layers, false);
                 if (model.arch == LLM_ARCH_DEEPSEEK4 && hparams.n_layer == 43 && hparams.nextn_predict_layers > 0) {
                     LLAMA_LOG_WARN("===============================================================================================\n");
@@ -1945,6 +1946,25 @@ void llm_load_hparams(
                     LLAMA_LOG_WARN("   -> setting nextn_predict_layers to zero\n");
                     LLAMA_LOG_WARN("===============================================================================================\n");
                     hparams.nextn_predict_layers = 0;
+                }
+                // V4.1 GGUFs carry block_count = backbone ONLY: the MTP predictor
+                // blocks are not separate blocks in the file (compress_ratios lists
+                // nextn extra descriptors beyond n_layer, but no blk.{n_layer}+
+                // tensors exist). The runtime otherwise assumes block_count INCLUDES
+                // the MTP layers (the V4 convention) and sizes the KV cache / graph
+                // for n_layer - nextn backbone layers, silently dropping the last
+                // nextn real layers. Probe for the first MTP block and zero nextn
+                // when it is absent so every downstream n_layer - nextn site sees
+                // the true backbone count.
+                if (model.arch == LLM_ARCH_DEEPSEEK41 && hparams.nextn_predict_layers > 0) {
+                    const std::string dsv41_mtp_probe = format("blk.%u.attn_norm.weight", hparams.n_layer);
+                    if (ml.get_tensor_meta(dsv41_mtp_probe.c_str()) == nullptr) {
+                        LLAMA_LOG_WARN("%s: deepseek41 GGUF carries no blk.%u MTP blocks (block_count = backbone only)\n",
+                                __func__, hparams.n_layer);
+                        LLAMA_LOG_WARN("%s:  -> setting nextn_predict_layers to zero so all %u layers are treated as backbone\n",
+                                __func__, hparams.n_layer);
+                        hparams.nextn_predict_layers = 0;
+                    }
                 }
                 // Probe the first appended predictor block, or n_layer - 1 for base GGUFs.
                 const uint32_t dsv4_probe_offset = std::max<uint32_t>(1, hparams.nextn_predict_layers);
@@ -2071,6 +2091,19 @@ void llm_load_hparams(
                     }
                     ml.get_key(LLM_KV_HASH_LAYER_COUNT, hparams.dsv4_hash_layer_count, false);
 
+                    // DeepSeek-V4.1: engram conditional-memory modules + VL routing bias.
+                    ml.get_key(LLM_KV_ENGRAM_HEAD_COUNT, hparams.dsv4_engram_head_count, false);
+                    ml.get_key(LLM_KV_ENGRAM_KEY_LENGTH, hparams.dsv4_engram_key_length, false);
+                    ml.get_key(LLM_KV_ENGRAM_MAX_NGRAM_SIZE, hparams.dsv4_engram_max_ngram_size, false);
+                    uint32_t n_engram_layers = 0;
+                    if (ml.get_arr_n(LLM_KV_ENGRAM_LAYER_IDS, n_engram_layers, false)) {
+                        ml.get_arr(ml.llm_kv(LLM_KV_ENGRAM_LAYER_IDS), hparams.dsv4_engram_layer_ids, false);
+                        hparams.dsv4_engram_layer_count = n_engram_layers;
+                    }
+                    if (ml.get_tensor_meta(format("blk.%u.exp_probs_b_vl.bias", dsv4_probe_layer).c_str()) != nullptr) {
+                        hparams.dsv4_exp_probs_b_vl = true;
+                    }
+
                     uint32_t n_compress_ratios = 0;
                     if (ml.get_arr_n(LLM_KV_ATTENTION_COMPRESS_RATIOS, n_compress_ratios, false)) {
                         if (n_compress_ratios < hparams.n_layer) {
@@ -2095,6 +2128,98 @@ void llm_load_hparams(
 
                             hparams.dsv4_compress_ratios[il] = has_indexer ? 4 : (has_attn_compress ? 128 : 0);
                         }
+                    }
+
+                    // Derive the two compressed-group ratios from the distinct nonzero
+                    // compress_ratios, in order of first appearance. V4 = {4,128};
+                    // V4.1 = {2,1}. Replaces the V4-only hardcoded CSA_RATIO/HCA_RATIO.
+                    {
+                        uint32_t csa_ratio = 0, hca_ratio = 0;
+                        for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+                            const uint32_t r = hparams.dsv4_compress_ratios[il];
+                            if (r == 0) continue;
+                            if (csa_ratio == 0) { csa_ratio = r; }
+                            else if (r != csa_ratio && hca_ratio == 0) { hca_ratio = r; }
+                        }
+                        if (csa_ratio != 0) { hparams.dsv4_csa_ratio = csa_ratio; }
+                        if (hca_ratio != 0) { hparams.dsv4_hca_ratio = hca_ratio; }
+                        hparams.dsv4_lid_ratio = std::min(hparams.dsv4_csa_ratio, hparams.dsv4_hca_ratio);
+                    }
+
+                    // Derive cross-layer CSA2 source maps from compress_ratios + the
+                    // layer-group structure. The V4.1 GGUF has NO
+                    // kv_source_layer_ids / index_source_layer_ids, so we derive:
+                    //   - KV source = the group's Full/Reindex layer (encoder: layers
+                    //     2,8,14; decoder: 20 and the Reindex 24,28,32,36)
+                    //   - index source = the same (Full/Reindex); Reuse layers neither
+                    //     own a cache nor run the indexer
+                    //   - kv_src_layer[il] = last KV source at or before il
+                    // For V4 (has explicit source ids OR the ratio!=0/ratio==4 rule),
+                    // the parser path above already set dsv4_compress_ratios; the V4
+                    // source rule is is_kv_source=(ratio!=0), is_index_source=(ratio==4).
+                    // We apply the V4 rule for arch DEEPSEEK4, and the derived
+                    // Full/Reindex/Reuse rule for arch DEEPSEEK41.
+                    {
+                        for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+                            hparams.dsv4_is_kv_source[il]   = false;
+                            hparams.dsv4_is_index_source[il] = false;
+                        }
+                        if (model.arch == LLM_ARCH_DEEPSEEK41) {
+                            // KV-source layers OWN a compressor + indexer K projector:
+                            // layers 2, 8, 14 (encoder Fulls) and 20 (decoder Full).
+                            // Verified against the GGUF tensor distribution: only these
+                            // four layers carry attn_compressor_kv + indexer.attn_k +
+                            // indexer.k_norm.
+                            for (uint32_t s : {2u, 8u, 14u, 20u}) {
+                                hparams.dsv4_is_kv_source[s] = true;
+                            }
+                            // Index-source layers run the indexer and publish a top-k:
+                            // the Full layers (2,8,14,20) + the decoder Reindex layers
+                            // (24,28,32,36). Verified: these carry indexer.attn_q_b +
+                            // indexer.proj.
+                            for (uint32_t s : {2u, 8u, 14u, 20u, 24u, 28u, 32u, 36u}) {
+                                hparams.dsv4_is_index_source[s] = true;
+                            }
+                        } else {
+                            // V4 rule: every compressing layer is its own KV source;
+                            // index source = ratio==4 (CSA group).
+                            for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+                                const uint32_t r = hparams.dsv4_compress_ratios[il];
+                                hparams.dsv4_is_kv_source[il]   = r != 0;
+                                hparams.dsv4_is_index_source[il] = r == 4;
+                            }
+                        }
+                        int32_t src = -1;
+                        for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+                            if (hparams.dsv4_is_kv_source[il]) { src = (int32_t) il; }
+                            hparams.dsv4_kv_src_layer[il] = src;
+                        }
+                    }
+
+                    // V4.1 hierarchical sparse indexer candidate pool (tech report
+                    // §4.2): the decoder's first Full layer (20) publishes a block-
+                    // level candidate selection (max-pooled blocks of 8 compressed
+                    // rows, top-2048) and every later index source filters its own
+                    // scores with it. The GGUF may carry the keys; when absent we
+                    // derive the tech-report constants. Parsed only for DEEPSEEK41
+                    // so V4 keeps its inert defaults (candidate_block_size == 0)
+                    // and stays bit-unchanged.
+                    if (model.arch == LLM_ARCH_DEEPSEEK41) {
+                        {
+                            uint32_t src = 0;
+                            if (ml.get_key(LLM_KV_CANDIDATE_SOURCE_LAYER, src, false)) {
+                                hparams.dsv4_candidate_source_layer = (int32_t) src;
+                            }
+                        }
+                        ml.get_key(LLM_KV_CANDIDATE_BLOCK_SIZE,  hparams.dsv4_candidate_block_size,  false);
+                        ml.get_key(LLM_KV_CANDIDATE_TOPK_BLOCKS, hparams.dsv4_candidate_topk_blocks, false);
+                        // derive only what is missing, so explicit keys / overrides win
+                        if (hparams.dsv4_candidate_source_layer < 0) { hparams.dsv4_candidate_source_layer = 20; }
+                        if (hparams.dsv4_candidate_block_size == 0)  { hparams.dsv4_candidate_block_size  = 8; }
+                        if (hparams.dsv4_candidate_topk_blocks == 0) { hparams.dsv4_candidate_topk_blocks = 2048; }
+                        LLAMA_LOG_INFO("%s: DSV4.1 hierarchical indexer: candidate source layer = %d, block size = %u, top-k blocks = %u\n",
+                                __func__, hparams.dsv4_candidate_source_layer,
+                                hparams.dsv4_candidate_block_size, hparams.dsv4_candidate_topk_blocks);
                     }
 
                     if (hparams.dsv4_hc_mult == 0) {

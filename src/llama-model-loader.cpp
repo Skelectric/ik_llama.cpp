@@ -714,6 +714,48 @@ void llama_model_loader::apply_ple_mmap_policy() const {
     }
 }
 
+// DeepSeek-V4.1 engram: the huge engram_embd tables (256 x ~384M rows, ~98 GB each)
+// are sparse-accessed via get_rows, so defer their mmap residency (like the qwen4exp
+// PLE) to keep them out of page cache until actually read. This makes the 508 GB
+// model load fast (only active engram rows paged in) and is the NVMe/SATA offload
+// path for the engram tables.
+void llama_model_loader::build_engram_tensor_index() {
+    engram_tensor_index = {};
+    engram_tensor_index.file_ranges.resize(files.size());
+
+    size_t deferred_bytes = 0;
+    for (const auto & weight : weights) {
+        const std::string name(weight.tensor->name);
+        if (name.find("engram_embd") == std::string::npos) {
+            continue;
+        }
+        const size_t tensor_bytes = ggml_nbytes(weight.tensor);
+        deferred_bytes += tensor_bytes;
+        engram_tensor_index.file_ranges.at(weight.idx).push_back({ weight.offs, weight.offs + tensor_bytes });
+    }
+
+    for (auto & ranges : engram_tensor_index.file_ranges) {
+        coalesce_ranges(ranges);
+    }
+
+    engram_tensor_index.deferred_bytes = deferred_bytes;
+    engram_tensor_index.dense_bytes = n_bytes > deferred_bytes ? n_bytes - deferred_bytes : 0;
+}
+
+bool llama_model_loader::should_defer_engram_mmaps() const {
+    return defer_engram && use_mmap && !engram_tensor_index.empty();
+}
+
+void llama_model_loader::apply_engram_mmap_policy() const {
+    for (size_t idx = 0; idx < engram_tensor_index.file_ranges.size(); ++idx) {
+        for (const auto & range : engram_tensor_index.file_ranges[idx]) {
+            // sparse row lookups through get_rows: readahead would evict more than it fetches
+            mappings[idx]->random_fragment(range.first, range.last);
+            mappings[idx]->dontneed_fragment(range.first, range.last);
+        }
+    }
+}
+
 template<typename T>
 typename std::enable_if<std::is_integral<T>::value, bool>::type
 llama_model_loader::get_arr_n(const std::string & key, T & result, const bool required) {

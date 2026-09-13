@@ -20,6 +20,7 @@
 #include "llama-spec-features.h"
 #include "llama-dflash.h"
 #include "llama-dsv4.h"
+#include "llama-engram.h"
 #include "llama-quantize.h"
 
 #include "unicode.h"
@@ -837,6 +838,11 @@ llama_context::llama_context(const llama_model & model)
     dsa_cache_copies.resize(hparams.n_layer);
     openpangu_cache_copies.resize(hparams.n_layer);
     openpangu_cache_copies_mtp.resize(hparams.n_layer);
+
+    // DeepSeek-V4.1 engram: load the hash-constants sidecar next to the model file
+    // (warns + leaves the module disabled when it is missing or fails validation)
+    llama_engram_init(*this);
+
     llama_all_contexts().push_back(this);
 }
 
@@ -4888,10 +4894,19 @@ static bool llm_load_tensors(
         LLAMA_LOG_WARN("%s: --defer-ple had no effect: creating the tensors disabled mmap\n", __func__);
     }
 
+    bool defer_engram_mmap = ml.should_defer_engram_mmaps();
+    if (defer_engram_mmap && use_mlock) {
+        LLAMA_LOG_WARN("%s: deferred engram loading disabled because mlock keeps mmap ranges resident\n", __func__);
+        defer_engram_mmap = false;
+    }
+    if (ml.defer_engram && !ml.use_mmap && !ml.engram_tensor_index.empty()) {
+        LLAMA_LOG_WARN("%s: --defer-engram had no effect: creating the tensors disabled mmap\n", __func__);
+    }
+
     ml.done_getting_tensors();
 
     // --dry-run skips MAP_POPULATE/WILLNEED — tensor data is never read.
-    ml.init_mappings(!defer_expert_mmap && !defer_ple_mmap && !dry_run, use_mlock ? &model.mlock_mmaps : nullptr, ml.use_thp);
+    ml.init_mappings(!defer_expert_mmap && !defer_ple_mmap && !defer_engram_mmap && !dry_run, use_mlock ? &model.mlock_mmaps : nullptr, ml.use_thp);
 
     // dropping a range discards an anonymous huge-page mapping, so test the mapping and not the -thp flag
     if (ml.has_anonymous_mapping()) {
@@ -4903,10 +4918,18 @@ static bool llm_load_tensors(
             LLAMA_LOG_WARN("%s: deferred per-layer token embedding disabled because the model is mapped on huge pages\n", __func__);
             defer_ple_mmap = false;
         }
+        if (defer_engram_mmap) {
+            LLAMA_LOG_WARN("%s: deferred engram loading disabled because the model is mapped on huge pages\n", __func__);
+            defer_engram_mmap = false;
+        }
     }
     if (defer_ple_mmap && !dry_run) {
         LLAMA_LOG_INFO("%s: deferring %.2f GiB of per-layer token embedding to the file\n", __func__,
                 ml.ple_tensor_index.deferred_bytes / 1024.0 / 1024.0 / 1024.0);
+    }
+    if (defer_engram_mmap && !dry_run) {
+        LLAMA_LOG_INFO("%s: deferring %.2f GiB of engram tables to the file\n", __func__,
+                ml.engram_tensor_index.deferred_bytes / 1024.0 / 1024.0 / 1024.0);
     }
 
     model.mappings.reserve(ml.mappings.size());
@@ -5053,6 +5076,9 @@ static bool llm_load_tensors(
         if (defer_ple_mmap) {
             ml.apply_ple_mmap_policy();
         }
+        if (defer_engram_mmap) {
+            ml.apply_engram_mmap_policy();
+        }
     }
 
     if (model.is_mla_model()) {
@@ -5170,11 +5196,14 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
                 params.defer_experts,
                 params.kv_overrides, params.tensor_buft_overrides);
 
+        model.path = fname;
+
         model.hparams.vocab_only = params.vocab_only;
 
         model.mtp = params.mtp;
 
         ml.defer_ple = params.defer_ple;
+        ml.defer_engram = params.defer_engram;
 
         try {
             llm_load_arch(ml, model);
@@ -5214,6 +5243,20 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
             }
 #else
             LLAMA_LOG_WARN("%s: deferred per-layer token embedding is only supported on Linux; ignoring defer_ple\n", __func__);
+#endif
+        }
+        if (params.defer_engram) {
+#ifdef __linux__
+            if (!params.use_mmap) {
+                LLAMA_LOG_WARN("%s: --defer-engram had no effect: mmap is disabled\n", __func__);
+            } else {
+                ml.build_engram_tensor_index();
+                if (ml.engram_tensor_index.empty()) {
+                    LLAMA_LOG_WARN("%s: --defer-engram had no effect: no engram tensors\n", __func__);
+                }
+            }
+#else
+            LLAMA_LOG_WARN("%s: deferred engram tables are only supported on Linux; ignoring defer_engram\n", __func__);
 #endif
         }
         try {
@@ -7054,7 +7097,7 @@ static int llama_decode_internal(
 
             // must run before can_reuse_graph()
             llama_kv_cache_compact_swa(lctx, u_batch.n_tokens);
-            if (lctx.model.arch == LLM_ARCH_DEEPSEEK4 && !llama_prepare_dsv4_graph_inputs(lctx, u_batch, false, false)) {
+            if ((lctx.model.arch == LLM_ARCH_DEEPSEEK4 || lctx.model.arch == LLM_ARCH_DEEPSEEK41) && !llama_prepare_dsv4_graph_inputs(lctx, u_batch, false, false)) {
                 return GGML_STATUS_FAILED;
             }
         }
@@ -7126,7 +7169,12 @@ static int llama_decode_internal(
             return GGML_STATUS_FAILED;
         }
 
-        if (lctx.model.arch == LLM_ARCH_DEEPSEEK4 && !llama_prepare_dsv4_graph_inputs(lctx, u_batch, true, false)) {
+        if ((lctx.model.arch == LLM_ARCH_DEEPSEEK4 || lctx.model.arch == LLM_ARCH_DEEPSEEK41) && !llama_prepare_dsv4_graph_inputs(lctx, u_batch, true, false)) {
+            return GGML_STATUS_FAILED;
+        }
+
+        // V4.1 engram: fill the per-layer lookup inputs (hash + host-side table gather)
+        if (lctx.engram.enabled && !llama_engram_prepare_inputs(lctx, u_batch)) {
             return GGML_STATUS_FAILED;
         }
 
@@ -7988,7 +8036,7 @@ static int32_t llama_kv_cache_update_internal(struct llama_context & lctx) {
         int n_past = lctx.cparams.n_ctx - n_tokens;
         llama_token token = llama_token_bos(&lctx.model); // not actually used by llama_build_graph, but required to choose between token and embedding inputs graph
         llama_batch reserve_batch = llama_batch_get_one(&token, n_tokens, n_past, 0);
-        if (lctx.model.arch == LLM_ARCH_DEEPSEEK4 && !llama_prepare_dsv4_graph_inputs(lctx, reserve_batch, false, true)) {
+        if ((lctx.model.arch == LLM_ARCH_DEEPSEEK4 || lctx.model.arch == LLM_ARCH_DEEPSEEK41) && !llama_prepare_dsv4_graph_inputs(lctx, reserve_batch, false, true)) {
             return GGML_STATUS_FAILED;
         }
         ggml_cgraph * gf = llm_build_context::llama_build_graph(lctx, reserve_batch, true, lctx.cparams.worst_graph_tokens);
@@ -8267,6 +8315,7 @@ struct llama_model_params llama_model_default_params() {
         /*.flash_attn                  =*/ true,
         /*.defer_experts               =*/ false,
         /*.defer_ple                   =*/ false,
+        /*.defer_engram                =*/ false,
         /*.swa_compress                =*/ false,
     };
 
@@ -9374,7 +9423,7 @@ struct llama_context * llama_init_from_model(
             int n_past = cparams.n_ctx - n_tokens;
             llama_token token = llama_token_bos(&ctx->model); // not actually used by llama_build_graph, but required to choose between token and embedding inputs graph
             llama_batch reserve_batch = llama_batch_get_one(&token, n_tokens, n_past, 0);
-            if (ctx->model.arch == LLM_ARCH_DEEPSEEK4 && !llama_prepare_dsv4_graph_inputs(*ctx, reserve_batch, false, true)) {
+            if ((ctx->model.arch == LLM_ARCH_DEEPSEEK4 || ctx->model.arch == LLM_ARCH_DEEPSEEK41) && !llama_prepare_dsv4_graph_inputs(*ctx, reserve_batch, false, true)) {
                 llama_free(ctx);
                 return nullptr;
             }
@@ -9562,6 +9611,7 @@ enum llama_rope_type llama_rope_type(const struct llama_model * model) {
         case LLM_ARCH_ARCTIC:
         case LLM_ARCH_DEEPSEEK2:
         case LLM_ARCH_DEEPSEEK4:
+        case LLM_ARCH_DEEPSEEK41:
         case LLM_ARCH_CHATGLM:
         case LLM_ARCH_GLM4:
         case LLM_ARCH_GRANITE:
@@ -10106,7 +10156,7 @@ static const char * llama_spec_ckpt_mode_name(int mode) {
 
 int llama_spec_ckpt_init(struct llama_context * ctx, int mode, int max_tokens) {
     auto & kv = ctx->kv_self;
-    const bool is_dsv4 = ctx->model.arch == LLM_ARCH_DEEPSEEK4;
+    const bool is_dsv4 = llm_arch_is_dsv4(ctx->model.arch);
 
     kv.save_per_step_ssm     = false;
     kv.ckpt.selected_spec_mode = LLAMA_SPEC_CKPT_NONE;
@@ -10208,20 +10258,20 @@ bool llama_spec_ckpt_save(struct llama_context * ctx, llama_seq_id seq_id) {
 
     switch (kv.ckpt.selected_spec_mode) {
         case LLAMA_SPEC_CKPT_PER_STEP:
-            if (ctx->model.arch == LLM_ARCH_DEEPSEEK4) {
+            if (llm_arch_is_dsv4(ctx->model.arch)) {
                 return llama_dsv4_spec_ckpt_save(ctx, true);
             }
             kv.save_per_step_ssm = true;
             return true;
 
         case LLAMA_SPEC_CKPT_GPU_FALLBACK:
-            if (ctx->model.arch == LLM_ARCH_DEEPSEEK4) {
+            if (llm_arch_is_dsv4(ctx->model.arch)) {
                 return llama_dsv4_spec_ckpt_save(ctx, true);
             }
             return kv.checkpoint_save(ctx->sched);
 
         case LLAMA_SPEC_CKPT_CPU: {
-            if (ctx->model.arch == LLM_ARCH_DEEPSEEK4) {
+            if (llm_arch_is_dsv4(ctx->model.arch)) {
                 return llama_dsv4_spec_ckpt_save(ctx, false);
             }
             const size_t need = llama_state_seq_get_size(ctx, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
@@ -10244,7 +10294,7 @@ enum llama_spec_ckpt_restore_result llama_spec_ckpt_restore_ex(
 
     switch (kv.ckpt.selected_spec_mode) {
         case LLAMA_SPEC_CKPT_PER_STEP: {
-            if (ctx->model.arch == LLM_ARCH_DEEPSEEK4) {
+            if (llm_arch_is_dsv4(ctx->model.arch)) {
                 const llama_pos accepted_pos = n_past + accepted_step;
                 llama_kv_cache_seq_rm(kv, seq_id, accepted_pos + 1, -1);
                 return llama_dsv4_spec_ckpt_restore(ctx, true, accepted_step);
@@ -10261,7 +10311,7 @@ enum llama_spec_ckpt_restore_result llama_spec_ckpt_restore_ex(
         }
 
         case LLAMA_SPEC_CKPT_GPU_FALLBACK:
-            if (ctx->model.arch == LLM_ARCH_DEEPSEEK4) {
+            if (llm_arch_is_dsv4(ctx->model.arch)) {
                 llama_kv_cache_seq_rm(kv, seq_id, n_past, -1);
                 return llama_dsv4_spec_ckpt_restore(ctx, true, 0);
             }
@@ -10272,7 +10322,7 @@ enum llama_spec_ckpt_restore_result llama_spec_ckpt_restore_ex(
             return LLAMA_SPEC_CKPT_RESTORE_BASE_REPLAY_REQUIRED;
 
         case LLAMA_SPEC_CKPT_CPU: {
-            if (ctx->model.arch == LLM_ARCH_DEEPSEEK4) {
+            if (llm_arch_is_dsv4(ctx->model.arch)) {
                 llama_kv_cache_seq_rm(kv, seq_id, n_past, -1);
                 return llama_dsv4_spec_ckpt_restore(ctx, false, 0);
             }
@@ -10312,7 +10362,7 @@ void llama_spec_ckpt_discard(struct llama_context * ctx) {
         kv.save_per_step_ssm = false;
         kv.checkpoint_delete();
     } else if (kv.ckpt.selected_spec_mode == LLAMA_SPEC_CKPT_GPU_FALLBACK &&
-               ctx->model.arch != LLM_ARCH_DEEPSEEK4) {
+               !llm_arch_is_dsv4(ctx->model.arch)) {
         kv.checkpoint_delete();
     }
 
@@ -10323,7 +10373,7 @@ void llama_spec_ckpt_discard(struct llama_context * ctx) {
 
 bool llama_kv_cache_seq_rm(struct llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     const bool result = llama_kv_cache_seq_rm(ctx->kv_self, seq_id, p0, p1);
-    if (result && ctx->model.arch == LLM_ARCH_DEEPSEEK4 && p0 <= 0 && p1 < 0) {
+    if (result && llm_arch_is_dsv4(ctx->model.arch) && p0 <= 0 && p1 < 0) {
         llama_reset_dsv4_state(ctx, seq_id);
     }
     return result;
