@@ -1034,10 +1034,18 @@ bool llama_context::ensure_dsv4_cache_tensors() {
             // V4.1: the decoder ratio-1 index-source layers (20,24,28,32,36) own a lid
             // (index-key) cache even though they are hca-ratio layers. Allocate lid_k +
             // lid_state for them here so dsv4_build_v41_index_key can write into it.
+            //
+            // NOTE: lid_state rows MUST match the ratio-2 layers' lid_state rows. The lid
+            // plan is SHARED across both groups and derives its write positions from a
+            // single lid_state_size (the first non-null lid_state_kv's ne[1], = 1*csa_ratio
+            // = 2 in V4.1). Allocating 1 row here (hca_ratio*n_stream) made that one plan
+            // address dst rows {0,1} against 1-row tensors, which failed the speculative
+            // per-step checkpoint restore with
+            //   "invalid visible DSV4 state row src=0 dst=1 state_rows=1".
             if (model.arch == LLM_ARCH_DEEPSEEK41 && model.hparams.dsv4_is_index_source[(size_t) il]) {
                 cache.lid_k[(size_t) il] = ggml_new_tensor_3d(cache.cache_ctx, cparams.idx_type_k, n_indexer_head, lid_kv*n_stream, 1);
-                cache.lid_state_kv[(size_t) il] = ggml_new_tensor_2d(cache.cache_ctx, GGML_TYPE_F32, n_indexer_head, hca_ratio*n_stream);
-                cache.lid_state_score[(size_t) il] = ggml_new_tensor_2d(cache.cache_ctx, GGML_TYPE_F32, n_indexer_head, hca_ratio*n_stream);
+                cache.lid_state_kv[(size_t) il] = ggml_new_tensor_2d(cache.cache_ctx, GGML_TYPE_F32, n_indexer_head, csa_state_width*csa_ratio*n_stream);
+                cache.lid_state_score[(size_t) il] = ggml_new_tensor_2d(cache.cache_ctx, GGML_TYPE_F32, n_indexer_head, csa_state_width*csa_ratio*n_stream);
                 if (!alloc_tensor(cache.lid_k[(size_t) il], buft) ||
                     !alloc_tensor(cache.lid_state_kv[(size_t) il], buft) ||
                     !alloc_tensor(cache.lid_state_score[(size_t) il], buft)) {
@@ -1376,7 +1384,7 @@ static bool dsv4_per_step_capture_group(
 }
 
 bool llama_dsv4_spec_ckpt_capture_rows(llama_context * ctx) {
-    if (ctx == nullptr || ctx->model.arch != LLM_ARCH_DEEPSEEK4) {
+    if (ctx == nullptr || !llm_arch_is_dsv4(ctx->model.arch)) {
         return true;
     }
 
@@ -1497,7 +1505,7 @@ static bool dsv4_spec_ckpt_copy_gpu(
 }
 
 bool llama_dsv4_spec_ckpt_prepare(llama_context * ctx, int mode, int max_tokens) {
-    if (ctx == nullptr || ctx->model.arch != LLM_ARCH_DEEPSEEK4) {
+    if (ctx == nullptr || !llm_arch_is_dsv4(ctx->model.arch)) {
         return true;
     }
 
@@ -1511,7 +1519,7 @@ bool llama_dsv4_spec_ckpt_prepare(llama_context * ctx, int mode, int max_tokens)
 }
 
 bool llama_dsv4_spec_ckpt_save(llama_context * ctx, bool use_gpu) {
-    if (ctx == nullptr || ctx->model.arch != LLM_ARCH_DEEPSEEK4) {
+    if (ctx == nullptr || !llm_arch_is_dsv4(ctx->model.arch)) {
         return true;
     }
 
@@ -1626,7 +1634,7 @@ static enum llama_spec_ckpt_restore_result dsv4_per_step_restore_rows(
 }
 
 enum llama_spec_ckpt_restore_result llama_dsv4_spec_ckpt_restore(llama_context * ctx, bool use_gpu, int accepted_step) {
-    if (ctx == nullptr || ctx->model.arch != LLM_ARCH_DEEPSEEK4) {
+    if (ctx == nullptr || !llm_arch_is_dsv4(ctx->model.arch)) {
         return LLAMA_SPEC_CKPT_RESTORE_FAILED;
     }
 

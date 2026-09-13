@@ -95,6 +95,16 @@ enum llm_arch {
     LLM_ARCH_UNKNOWN,
 };
 
+// DSV4 family: V4 and V4.1 share the compressed-KV (CSA/LID) cache machinery, its
+// speculative-decoding checkpoint plumbing, and the private per-context cache state
+// that seq_cp cannot copy. Use this helper for "is the DSV4 custom-cache path
+// active" checks. Where V4 and V4.1 genuinely differ, keep testing LLM_ARCH_DEEPSEEK4
+// explicitly -- notably the CSA overlap layout (llama-dsv4.cpp csa_overlap) and the
+// K-only window cache (llama.cpp is_dsv4_k_only).
+static inline bool llm_arch_is_dsv4(enum llm_arch arch) {
+    return arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41;
+}
+
 enum llm_kv {
     LLM_KV_GENERAL_TYPE,
     LLM_KV_GENERAL_ARCHITECTURE,

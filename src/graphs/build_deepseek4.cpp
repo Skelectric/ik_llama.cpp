@@ -1941,6 +1941,21 @@ ggml_cgraph * llm_build_context::build_deepseek41() {
             cb(inpL, "engram_out", il);
         }
 
+        // ---- DSpark target-feature capture. V4.1 reads the ATTENTION INPUT of
+        //      its target layers, not their output (reference model.py: "the MTP
+        //      head reads the attention input of its target layers, not their
+        //      output"), so l_out-<il> must be this layer's INCOMING residual --
+        //      the post-engram h captured before the block runs. V4
+        //      (build_deepseek4) captures the layer OUTPUT instead; do not
+        //      "harmonise" that path.
+        if (lctx.dflash.capture) {
+            ggml_tensor * capture = dsv4_hc_mean_for_capture(ctx0, inpL);
+            cb(capture, "l_out", il);
+            ggml_build_forward_expand(gf, capture);
+        } else {
+            cb(inpL, "l_out", il);
+        }
+
         // ---- CSA2 attention (reuses the V4 ds4_attention machinery: MLA latent +
         //      pooled compressed K + LID indexer top-k selection). For V4.1 both
         //      nonzero-ratio groups route through the indexer path (no dense HCA).
@@ -2036,7 +2051,12 @@ ggml_cgraph * llm_build_context::build_dflash_dsv4() {
     GGML_ASSERT(hparams.n_head_kv() == 1);
     GGML_ASSERT(model.dflash_fc != nullptr);
     GGML_ASSERT(model.dflash_hidden_norm != nullptr);
-    GGML_ASSERT(model.hc_head_fn != nullptr && model.hc_head_base != nullptr && model.hc_head_scale != nullptr);
+    // V4 drafts carry a learned head collapse; the V4.1 drafter does not (its head
+    // uses the mHC pre-mix carried out of the last FFN sublayer). Require them to be
+    // all-present or all-absent so the two variants cannot be mixed up.
+    const bool hc_carry_collapse = model.hc_head_fn == nullptr;
+    GGML_ASSERT((!hc_carry_collapse && model.hc_head_base != nullptr && model.hc_head_scale != nullptr) ||
+                (hc_carry_collapse && model.hc_head_base == nullptr && model.hc_head_scale == nullptr));
 
     ggml_cgraph * gf = ggml_new_graph_custom(ctx0, model.max_nodes((int) std::max<int64_t>(n_tokens, ctx_len)) + 48 * n_layer, false);
 
@@ -2064,7 +2084,13 @@ ggml_cgraph * llm_build_context::build_dflash_dsv4() {
         qr = llm_build_norm(ctx0, qr, hparams, layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, cb, il);
         ggml_tensor * q = llm_build_lora_mm(lctx, ctx0, layer.wq_b, qr);
         q = ggml_reshape_2d(ctx0, q, n_embd_head, n_head * n_tokens);
-        q = ggml_rms_norm(ctx0, q, hparams.f_norm_rms_eps);
+        // V4's reference qk-norms the projected query; V4.1's DSparkAttention does
+        // NOT (qr = q_norm(wq_a(x)); q = wq_b(qr) -- nothing else). Normalising q
+        // here rescales the attention logits per head and flattens the softmax for
+        // the V4.1 drafter, washing out the window context.
+        if (!hc_carry_collapse) {
+            q = ggml_rms_norm(ctx0, q, hparams.f_norm_rms_eps);
+        }
         q = ggml_reshape_3d(ctx0, q, n_embd_head, n_head, n_tokens);
         q = ggml_rope_ext_inplace(ctx0, q, inp_pos, nullptr, n_embd_head_rope, rope_type, 0,
                 freq_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
@@ -2112,6 +2138,12 @@ ggml_cgraph * llm_build_context::build_dflash_dsv4() {
         }
         cb(attn, "dsv4_dflash_attn", il);
         ggml_build_forward_expand(gf, attn);
+        // TEMP-DEBUG (dspark): per-position attention-output stats
+        if (getenv("DSPARK_DUMP")) {
+            char nm[32];
+            snprintf(nm, sizeof(nm), "dsparkdbg-attn-%d", (int) il);
+            ggml_set_name(attn, nm);
+        }
 
         attn = ggml_reshape_3d(ctx0, attn, n_embd_head, n_head, n_tokens);
         attn = ggml_rope_ext_inplace(ctx0, attn, inp_pos, nullptr, n_embd_head_rope, rope_type, 0,
@@ -2132,20 +2164,41 @@ ggml_cgraph * llm_build_context::build_dflash_dsv4() {
     };
 
     ggml_tensor * inp_pos = build_inp_pos();
+    // mHC carry threading. The V4.1 drafter follows the V4.1 backbone rule: each
+    // sublayer consumes the PREVIOUS sublayer's pre-mix and the final collapse uses
+    // the last FFN's. V4's drafter recomputes per sublayer, so keep hc_carry null
+    // there to leave that path bit-unchanged.
+    ggml_tensor * hc_carry_v = nullptr;
+    ggml_tensor ** hc_carry = hc_carry_collapse ? &hc_carry_v : nullptr;
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers[il];
         ggml_tensor * residual = inpL;
         ggml_tensor * post = nullptr;
         ggml_tensor * comb = nullptr;
         ggml_tensor * cur = build_hc_pre(ctx0, *this, hparams, n_embd, hparams.f_norm_rms_eps, inpL,
-                layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base, &post, &comb, cb, il);
+                layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base, &post, &comb, cb, il, hc_carry);
+        if (getenv("DSPARK_DUMP")) {
+            char nm[32];
+            snprintf(nm, sizeof(nm), "dsparkdbg-collapse-%d", (int) il);
+            ggml_set_name(cur, nm);
+        }
         cur = llm_build_norm(ctx0, cur, hparams, layer.attn_norm, nullptr, LLM_NORM_RMS, cb, il);
         cur = build_attention(il, cur, inp_pos);
         inpL = build_mhc_post(cur, post, residual, comb, n_embd, hparams.dsv4_hc_mult, true);
+        if (getenv("DSPARK_DUMP")) {
+            char nm[32];
+            snprintf(nm, sizeof(nm), "dsparkdbg-post-%d", (int) il);
+            ggml_set_name(inpL, nm);
+        }
 
         residual = inpL;
         cur = build_hc_pre(ctx0, *this, hparams, n_embd, hparams.f_norm_rms_eps, inpL,
-                layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base, &post, &comb, cb, il);
+                layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base, &post, &comb, cb, il, hc_carry);
+        if (getenv("DSPARK_DUMP")) {
+            char nm[32];
+            snprintf(nm, sizeof(nm), "dsparkdbg-ffncollapse-%d", (int) il);
+            ggml_set_name(cur, nm);
+        }
         cur = llm_build_norm(ctx0, cur, hparams, layer.ffn_norm, nullptr, LLM_NORM_RMS, cb, il);
         ggml_tensor * moe = llm_build_moe_ffn(ctx0, lctx, cur,
                 layer.ffn_gate_inp, nullptr,
@@ -2163,11 +2216,27 @@ ggml_cgraph * llm_build_context::build_dflash_dsv4() {
                 layer.ffn_down_shexp, nullptr, nullptr,
                 nullptr, LLM_FFN_SILU, LLM_FFN_PAR, cb, il, gf, false, false);
         cur = ggml_add(ctx0, moe, shexp);
+        if (getenv("DSPARK_DUMP")) {
+            char nm[32];
+            snprintf(nm, sizeof(nm), "dsparkdbg-ffnout-%d", (int) il);
+            ggml_set_name(cur, nm);
+        }
         inpL = build_mhc_post(cur, post, residual, comb, n_embd, hparams.dsv4_hc_mult, true);
     }
 
-    ggml_tensor * out = build_hc_head(ctx0, *this, hparams, n_embd, hparams.f_norm_rms_eps,
-            inpL, model.hc_head_fn, model.hc_head_scale, model.hc_head_base);
+    if (getenv("DSPARK_DUMP")) {
+        ggml_set_name(inpL, "dsparkdbg-final");
+    }
+
+    ggml_tensor * out;
+    if (hc_carry_collapse) {
+        // V4.1: no head weights -- collapse with the mix the last FFN carried out.
+        GGML_ASSERT(hc_carry_v != nullptr && "dflash V4.1: no mHC mix carried to the final collapse");
+        out = build_mhc_weighted_sum(inpL, hc_carry_v, n_embd, hparams.dsv4_hc_mult);
+    } else {
+        out = build_hc_head(ctx0, *this, hparams, n_embd, hparams.f_norm_rms_eps,
+                inpL, model.hc_head_fn, model.hc_head_scale, model.hc_head_base);
+    }
     out = llm_build_norm(ctx0, out, hparams, model.output_norm, nullptr, LLM_NORM_RMS, cb, -1);
     out = build_output(lctx, ctx0, out, model.output, nullptr, cb);
     if (lctx.dflash.dspark) {

@@ -797,6 +797,12 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     for (; i < draft.size(); i++) {
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
 
+        // TEMP-DEBUG (dspark): dump draft vs target-greedy per verify position
+        if (getenv("DSPARK_DUMP")) {
+            fprintf(stderr, "[dspark-verify] pos=%zu draft=%d target=%d %s\n",
+                    i, draft[i], id, draft[i] == id ? "ACCEPT" : "REJECT");
+        }
+
         gsmpl->drafted_text += common_token_to_piece(ctx, id, true);
 
         common_sampler_accept(gsmpl, ctx, id, true);
@@ -804,6 +810,14 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
         result.push_back(id);
 
         if (draft[i] != id) {
+            // TEMP-DEBUG (dspark): on the first reject, dump the remaining proposals
+            if (getenv("DSPARK_DUMP")) {
+                fprintf(stderr, "[dspark-verify] remaining proposals:");
+                for (size_t k = i + 1; k < draft.size(); k++) {
+                    fprintf(stderr, " %d", draft[k]);
+                }
+                fprintf(stderr, "\n");
+            }
             break;
         }
     }

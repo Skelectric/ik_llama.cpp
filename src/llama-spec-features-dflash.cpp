@@ -603,6 +603,74 @@ static int llama_dflash_capture_eval_callback(struct ggml_tensor * tensor, bool 
     return 2;
 }
 
+// TEMP-DEBUG (dspark): dump per-position stats for tensors named "dsparkdbg-*"
+// inside the DRAFT graph, installed on the draft context when DSPARK_DUMP=1.
+static int llama_dspark_debug_eval_callback(struct ggml_tensor * tensor, bool ask, void * user_data) {
+    GGML_UNUSED(user_data);
+    if (std::strncmp(tensor->name, "dsparkdbg-", 10) != 0) {
+        return 0;
+    }
+    if (ask) {
+        return 2;
+    }
+    if (tensor->type != GGML_TYPE_F32) {
+        fprintf(stderr, "[dsparkdbg] %-24s ne=[%d,%d,%d] type=%s (skip)\n", tensor->name,
+                (int) tensor->ne[0], (int) tensor->ne[1], (int) tensor->ne[2], ggml_type_name(tensor->type));
+        return 2;
+    }
+    const int64_t w = tensor->ne[0];
+    const int64_t n = ggml_nelements(tensor);
+    std::vector<float> buf((size_t) n);
+    ggml_backend_tensor_get(tensor, buf.data(), 0, (size_t) n * sizeof(float));
+    fprintf(stderr, "[dsparkdbg] %-24s ne=[%d,%d,%d]", tensor->name,
+            (int) tensor->ne[0], (int) tensor->ne[1], (int) tensor->ne[2]);
+    const int64_t nh = tensor->ne[2] > 0 ? tensor->ne[2] : 1;
+    double gmax = 0.0;
+    for (int64_t i = 0; i < n; ++i) {
+        gmax = std::max(gmax, std::fabs((double) buf[(size_t) i]));
+    }
+    fprintf(stderr, " maxabs=%.4g", gmax);
+    for (int64_t j = 0; j < tensor->ne[1] && j < 8; ++j) {
+        double s = 0.0;
+        int64_t cnt = 0;
+        for (int64_t h = 0; h < nh; ++h) {
+            for (int64_t i = 0; i < w; ++i) {
+                s += std::fabs((double) buf[(size_t) (i + j * w + h * tensor->ne[1] * w)]);
+                cnt++;
+            }
+        }
+        fprintf(stderr, " t%lld=%.4g", (long long) j, s / (double) cnt);
+    }
+    if (tensor->ne[2] > 1) {
+        fprintf(stderr, " | per-pos:");
+        for (int64_t t = 0; t < tensor->ne[2] && t < 8; ++t) {
+            double s = 0.0;
+            int64_t cnt = 0;
+            for (int64_t h = 0; h < tensor->ne[1]; ++h) {
+                for (int64_t i = 0; i < w; ++i) {
+                    s += std::fabs((double) buf[(size_t) (i + h * w + t * w * tensor->ne[1])]);
+                    cnt++;
+                }
+            }
+            fprintf(stderr, " p%lld=%.4g", (long long) t, s / (double) cnt);
+        }
+    }
+    fprintf(stderr, "\n");
+    return 2;
+}
+
+bool llama_set_dspark_debug(struct llama_context * ctx) {
+    if (ctx == nullptr) {
+        return false;
+    }
+    ctx->cparams.cb_eval = llama_dspark_debug_eval_callback;
+    ctx->cparams.cb_eval_user_data = ctx;
+    if (ctx->sched != nullptr) {
+        ggml_backend_sched_set_eval_callback(ctx->sched, ctx->cparams.cb_eval, ctx->cparams.cb_eval_user_data);
+    }
+    return true;
+}
+
 bool llama_set_dflash_capture_layers(
         struct llama_context * ctx,
         const int32_t * layer_ids,

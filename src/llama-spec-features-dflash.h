@@ -117,6 +117,7 @@ bool llama_set_dflash_target_features_view(
 
 bool llama_set_dflash_capture_layers(struct llama_context * ctx, const int32_t * layer_ids, int32_t n_layers);
 void llama_clear_dflash_capture(struct llama_context * ctx);
+bool llama_set_dspark_debug(struct llama_context * ctx);   // TEMP-DEBUG (dspark)
 void llama_begin_dflash_capture_batch(struct llama_context * ctx, int32_t expected_rows);
 void llama_finish_dflash_capture_batch(struct llama_context * ctx, bool is_prompt_warmup);
 

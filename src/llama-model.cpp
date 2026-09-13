@@ -2469,7 +2469,11 @@ bool llama_model_has_recurrent(const llama_model * model) {
 }
 
 bool llama_model_is_deepseek4(const llama_model * model) {
-    return model && model->arch == LLM_ARCH_DEEPSEEK4;
+    // DSV4-family predicate: V4 and V4.1 share the compressed-KV (CSA/LID) cache,
+    // the private per-context cache state that seq_cp cannot copy, and the MTP/
+    // DSpark draft contract. V4.1 loads under its own arch (the GGUF is relabeled
+    // via --override-kv), so recognise both here rather than at every call site.
+    return model && (model->arch == LLM_ARCH_DEEPSEEK4 || model->arch == LLM_ARCH_DEEPSEEK41);
 }
 
 bool llama_model_is_openpangu(const llama_model * model) {
