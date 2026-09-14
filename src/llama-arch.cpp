@@ -327,12 +327,12 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
 LLM_KV::LLM_KV(llm_arch arch, const char* suffix) : arch(arch), suffix(suffix) {}
 
 std::string LLM_KV::operator()(llm_kv kv) const {
-    // TRACK B (temporary): DeepSeek-V4.1 currently reads the un-relabeled GGUF whose
-    // metadata keys use the "deepseek4." prefix (loaded as deepseek41 via
-    // --override-kv general.architecture=str:deepseek41). Substitute "deepseek4" so the
-    // arch-prefixed keys resolve. REVERT this once the GGUF is relabeled to
-    // "deepseek41." keys (miniPC / converter). Tensor names are hardcoded (not affected).
-    const char * arch_name = arch == LLM_ARCH_DEEPSEEK41 ? "deepseek4" : LLM_ARCH_NAMES.at(arch);
+    // TRACK A (finalized 2026-09-14): the DeepSeek-V4.1 GGUF now carries native
+    // "deepseek41." metadata keys (relabeled artifact; the old un-relabeled file was
+    // overwritten in place). The Track B "deepseek4" prefix substitution is reverted —
+    // arch-prefixed keys resolve under the arch's own name again. Note: --override-kv
+    // arch-prefixed keys must now use the "deepseek41." prefix.
+    const char * arch_name = LLM_ARCH_NAMES.at(arch);
     return suffix ? ::format(LLM_KV_NAMES.at(kv), arch_name, suffix)
         : ::format(LLM_KV_NAMES.at(kv), arch_name);
 }
