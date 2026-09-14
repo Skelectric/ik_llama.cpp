@@ -598,7 +598,7 @@ static uint64_t llama_ubatch_seq_fingerprint(const llama_batch & b, const llm_ar
 }
 
 static inline uint64_t model_state_hash(const llama_context & lctx) {
-    if (lctx.model.arch != LLM_ARCH_DEEPSEEK4) {
+    if (!llm_arch_is_dsv4(lctx.model.arch)) {
         return 0ull;
     }
     uint64_t h = 1469598103934665603ull;
@@ -610,6 +610,7 @@ static inline uint64_t model_state_hash(const llama_context & lctx) {
         mix(plan.state_read_idxs.size());
         mix(plan.state_write_idxs.size());
         mix(plan.state_write_pos.size());
+        mix(plan.state_write_idxs_lid.size());
         mix(plan.n_kv);
     };
     mix_plan(lctx.dsv4.csa_plan);
@@ -700,7 +701,12 @@ bool llama_context::can_reuse_graph(const llama_batch & u_batch, uint64_t seq_fi
 
 bool llama_context::update_cache_copies() {
     if (model.arch == LLM_ARCH_GEMMA4_MTP || model.arch == LLM_ARCH_GEMMA4_ASSISTANT) return true;
-    if (model.arch == LLM_ARCH_DEEPSEEK4) return true;
+    // DSV4 family: the raw K stores go through dsv4_raw_cpy_k (GGML_OP_SET_ROWS with
+    // per-batch idx inputs re-set every batch), not the generic GGML_OP_CPY path below
+    // — there is nothing to re-point on graph reuse. Without this early return V4.1
+    // falls into the generic loop, fails the CPY check at layer 0 ("K has no copy"),
+    // and silently denies ALL graph reuse (full rebuild every decode step).
+    if (llm_arch_is_dsv4(model.arch)) return true;
     auto patch_dsa_cache_copies = [&]() -> bool {
         // DSA indexer-key cache: patch the kr_l write offset for reused graphs. Each
         // registered cpy writes this ubatch's index keys into kr_l at the kv_head slot;
@@ -1254,7 +1260,7 @@ static bool llama_kv_cache_init(
         }
     }
 
-    const bool is_dsv4_k_only = model.arch == LLM_ARCH_DEEPSEEK4;
+    const bool is_dsv4_k_only = llm_arch_is_dsv4(model.arch);
     bool is_mla_attn = model.is_mla_model();
 
     bool split_cache   = false;
@@ -7245,7 +7251,7 @@ static int llama_decode_internal(
         //fprintf(stderr, "%s: invoking llama_graph_compute\n", __func__);
         llama_graph_compute(lctx, gf, n_threads);
 
-        if (lctx.model.arch == LLM_ARCH_DEEPSEEK4 &&
+        if (llm_arch_is_dsv4(lctx.model.arch) &&
             lctx.cparams.mtp_op_type == MTP_OP_NONE &&
             lctx.kv_self.ckpt.selected_spec_mode == LLAMA_SPEC_CKPT_PER_STEP &&
             !llama_dsv4_spec_ckpt_capture_rows(&lctx)) {
@@ -7954,8 +7960,8 @@ static int32_t llama_kv_cache_update_internal(struct llama_context & lctx) {
     // apply K-shift if needed
     if (lctx.model.hparams.rope_type != LLAMA_ROPE_TYPE_NONE && lctx.kv_self.has_shift) {
         if (!get_can_shift(lctx)) {
-            if (lctx.model.arch == LLM_ARCH_DEEPSEEK4) {
-                LLAMA_LOG_WARN("%s: DeepSeek4 does not support context shifting; use --no-context-shift or increase context size\n",
+            if (llm_arch_is_dsv4(lctx.model.arch)) {
+                LLAMA_LOG_WARN("%s: DeepSeek V4/V4.1 does not support context shifting; use --no-context-shift or increase context size\n",
                                __func__);
             }
             return 1;
@@ -8774,8 +8780,8 @@ struct llama_context * llama_init_from_model(
     //    params.flash_attn = false;
     //}
 
-    if (model->arch == LLM_ARCH_DEEPSEEK4 && params.type_v != GGML_TYPE_F16) {
-        LLAMA_LOG_WARN("%s: DeepSeek4 has no independent V-cache; ignoring requested V-cache type %s\n",
+    if (llm_arch_is_dsv4(model->arch) && params.type_v != GGML_TYPE_F16) {
+        LLAMA_LOG_WARN("%s: DeepSeek V4/V4.1 has no independent V-cache; ignoring requested V-cache type %s\n",
                 __func__, ggml_type_name(params.type_v));
         params.type_v = GGML_TYPE_F16;
     }
@@ -8786,21 +8792,21 @@ struct llama_context * llama_init_from_model(
         return nullptr;
     }
 
-    if (model->arch == LLM_ARCH_DEEPSEEK4 && params.k_cache_hadamard) {
-        LLAMA_LOG_ERROR("%s: DeepSeek4 K-cache Hadamard is not supported; use an untransformed K-cache\n",
+    if (llm_arch_is_dsv4(model->arch) && params.k_cache_hadamard) {
+        LLAMA_LOG_ERROR("%s: DeepSeek V4/V4.1 K-cache Hadamard is not supported; use an untransformed K-cache\n",
                         __func__);
         return nullptr;
     }
 
-    if (model->arch == LLM_ARCH_DEEPSEEK4 &&
+    if (llm_arch_is_dsv4(model->arch) &&
             params.type_k != GGML_TYPE_F16 && params.type_k != GGML_TYPE_BF16 && params.type_k != GGML_TYPE_Q8_0) {
-        LLAMA_LOG_ERROR("%s: DeepSeek4 K-cache supports only F16, BF16, and Q8_0 (requested %s)\n",
+        LLAMA_LOG_ERROR("%s: DeepSeek V4/V4.1 K-cache supports only F16, BF16, and Q8_0 (requested %s)\n",
                         __func__, ggml_type_name(params.type_k));
         return nullptr;
     }
 
-    if (model->arch == LLM_ARCH_DEEPSEEK4 && params.v_cache_hadamard) {
-        LLAMA_LOG_WARN("%s: DeepSeek4 has no independent V-cache; ignoring -vhad\n", __func__);
+    if (llm_arch_is_dsv4(model->arch) && params.v_cache_hadamard) {
+        LLAMA_LOG_WARN("%s: DeepSeek V4/V4.1 has no independent V-cache; ignoring -vhad\n", __func__);
         params.v_cache_hadamard = false;
     }
 
@@ -9334,7 +9340,7 @@ struct llama_context * llama_init_from_model(
                     LLAMA_LOG_INFO("%s: KV self size  = %7.2f MiB, c^KV (%s): %7.2f MiB, kv^T: not used\n", __func__,
                             (float)(memory_size_k + memory_size_v) / (1024.0f * 1024.0f),
                             ggml_type_name(type_k), (float)memory_size_k / (1024.0f * 1024.0f));
-                } else if (model->arch == LLM_ARCH_DEEPSEEK4) {
+                } else if (llm_arch_is_dsv4(model->arch)) {
                     LLAMA_LOG_INFO("%s: KV self size = %7.2f MiB, K-only (%s): %7.2f MiB; independent V-cache: not used\n", __func__,
                             (float) memory_size_k / (1024.0f * 1024.0f),
                             ggml_type_name(type_k), (float) memory_size_k / (1024.0f * 1024.0f));

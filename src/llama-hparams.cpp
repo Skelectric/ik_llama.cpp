@@ -2140,45 +2140,51 @@ void llm_load_hparams(
                             if (r == 0) continue;
                             if (csa_ratio == 0) { csa_ratio = r; }
                             else if (r != csa_ratio && hca_ratio == 0) { hca_ratio = r; }
+                            else if (model.arch == LLM_ARCH_DEEPSEEK41 && r != csa_ratio && r != hca_ratio) {
+                                throw std::runtime_error(format(
+                                    "DeepSeek-V4.1 layer %u compress ratio %u matches neither %u nor %u: at most two distinct nonzero ratios are supported",
+                                    il, r, csa_ratio, hca_ratio));
+                            }
                         }
                         if (csa_ratio != 0) { hparams.dsv4_csa_ratio = csa_ratio; }
                         if (hca_ratio != 0) { hparams.dsv4_hca_ratio = hca_ratio; }
                         hparams.dsv4_lid_ratio = std::min(hparams.dsv4_csa_ratio, hparams.dsv4_hca_ratio);
                     }
 
-                    // Derive cross-layer CSA2 source maps from compress_ratios + the
-                    // layer-group structure. The V4.1 GGUF has NO
-                    // kv_source_layer_ids / index_source_layer_ids, so we derive:
-                    //   - KV source = the group's Full/Reindex layer (encoder: layers
-                    //     2,8,14; decoder: 20 and the Reindex 24,28,32,36)
-                    //   - index source = the same (Full/Reindex); Reuse layers neither
-                    //     own a cache nor run the indexer
-                    //   - kv_src_layer[il] = last KV source at or before il
-                    // For V4 (has explicit source ids OR the ratio!=0/ratio==4 rule),
-                    // the parser path above already set dsv4_compress_ratios; the V4
-                    // source rule is is_kv_source=(ratio!=0), is_index_source=(ratio==4).
-                    // We apply the V4 rule for arch DEEPSEEK4, and the derived
-                    // Full/Reindex/Reuse rule for arch DEEPSEEK41.
+                    // Derive cross-layer CSA2 source maps. Neither V4 nor V4.1 GGUFs
+                    // carry kv_source_layer_ids / index_source_layer_ids:
+                    //   - V4.1: derive from TENSOR PRESENCE (the established loader
+                    //     idiom — see the V4 ratio probe above and the BAILINGMOE3 /
+                    //     DFLASH probes): a KV source owns the attention compressor
+                    //     that builds its group's compressed cache; an index source
+                    //     owns the indexer query and publishes a top-k. On the 748.5B
+                    //     file this yields KV sources {2,8,14,20} (Full layers) and
+                    //     index sources {2,8,14,20,24,28,32,36} (Full + Reindex);
+                    //     deriving it keeps any other V4.1 layer grouping correct
+                    //     instead of silently reading the wrong layer's cache.
+                    //   - V4: derive from compress_ratios — every compressing layer is
+                    //     its own KV source; index source = ratio==4 (CSA group).
+                    //   - kv_src_layer[il] = last KV source at or before il.
                     {
                         for (uint32_t il = 0; il < hparams.n_layer; ++il) {
                             hparams.dsv4_is_kv_source[il]   = false;
                             hparams.dsv4_is_index_source[il] = false;
                         }
-                        if (model.arch == LLM_ARCH_DEEPSEEK41) {
-                            // KV-source layers OWN a compressor + indexer K projector:
-                            // layers 2, 8, 14 (encoder Fulls) and 20 (decoder Full).
-                            // Verified against the GGUF tensor distribution: only these
-                            // four layers carry attn_compressor_kv + indexer.attn_k +
-                            // indexer.k_norm.
-                            for (uint32_t s : {2u, 8u, 14u, 20u}) {
-                                hparams.dsv4_is_kv_source[s] = true;
-                            }
-                            // Index-source layers run the indexer and publish a top-k:
-                            // the Full layers (2,8,14,20) + the decoder Reindex layers
-                            // (24,28,32,36). Verified: these carry indexer.attn_q_b +
-                            // indexer.proj.
-                            for (uint32_t s : {2u, 8u, 14u, 20u, 24u, 28u, 32u, 36u}) {
-                                hparams.dsv4_is_index_source[s] = true;
+                        // A standalone-MTP file (predictor block only, no blk.0.attn_norm)
+                        // has no compressed layers; its all-zero ratios fall through to
+                        // the V4 rule below and leave the maps empty.
+                        const bool v41_is_backbone =
+                            ml.get_tensor_meta("blk.0.attn_norm.weight") != nullptr;
+                        if (model.arch == LLM_ARCH_DEEPSEEK41 && v41_is_backbone) {
+                            for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+                                const bool has_compressor =
+                                    ml.get_tensor_meta(format("blk.%u.attn_compress_kv.weight",   il).c_str()) != nullptr ||
+                                    ml.get_tensor_meta(format("blk.%u.attn_compressor_kv.weight", il).c_str()) != nullptr;
+                                const bool has_indexer_q =
+                                    ml.get_tensor_meta(format("blk.%u.indexer.attn_q_b.weight", il).c_str()) != nullptr;
+
+                                hparams.dsv4_is_kv_source[il]    = has_compressor;
+                                hparams.dsv4_is_index_source[il] = has_indexer_q;
                             }
                         } else {
                             // V4 rule: every compressing layer is its own KV source;
@@ -2190,9 +2196,39 @@ void llm_load_hparams(
                             }
                         }
                         int32_t src = -1;
+                        bool any_kv_source = false;
                         for (uint32_t il = 0; il < hparams.n_layer; ++il) {
-                            if (hparams.dsv4_is_kv_source[il]) { src = (int32_t) il; }
+                            if (hparams.dsv4_is_kv_source[il]) { src = (int32_t) il; any_kv_source = true; }
                             hparams.dsv4_kv_src_layer[il] = src;
+                        }
+                        if (model.arch == LLM_ARCH_DEEPSEEK41 && v41_is_backbone) {
+                            // Structural validation: the file must define at least one
+                            // KV source, and every layer that reads a compressed stream
+                            // (nonzero ratio) or runs the indexer must have a KV source
+                            // at or before itself.
+                            if (!any_kv_source) {
+                                throw std::runtime_error("DeepSeek-V4.1 GGUF defines no attention-compressor (KV-source) layers");
+                            }
+                            for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+                                const bool reads_compressed = hparams.dsv4_compress_ratios[il] != 0;
+                                if ((reads_compressed || hparams.dsv4_is_index_source[il]) && hparams.dsv4_kv_src_layer[il] < 0) {
+                                    throw std::runtime_error(format(
+                                        "DeepSeek-V4.1 layer %u reads a compressed stream but no KV-source layer precedes it", il));
+                                }
+                            }
+                            std::string kv_src_list, idx_src_list;
+                            for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+                                if (hparams.dsv4_is_kv_source[il]) {
+                                    if (!kv_src_list.empty()) kv_src_list += ",";
+                                    kv_src_list += std::to_string(il);
+                                }
+                                if (hparams.dsv4_is_index_source[il]) {
+                                    if (!idx_src_list.empty()) idx_src_list += ",";
+                                    idx_src_list += std::to_string(il);
+                                }
+                            }
+                            LLAMA_LOG_INFO("%s: deepseek41 CSA2 source maps (tensor-derived): KV sources {%s}, index sources {%s}\n",
+                                    __func__, kv_src_list.c_str(), idx_src_list.c_str());
                         }
                     }
 

@@ -2779,14 +2779,25 @@ size_t llama_model::cache_size(int il, ggml_type type_k, ggml_type type_v, ggml_
         }
         return size;
     }
-    if (arch == LLM_ARCH_DEEPSEEK4) {
-        constexpr uint32_t csa_ratio = 4;
-        constexpr uint32_t hca_ratio = 128;
+    if (llm_arch_is_dsv4(arch)) {
+        // Mirror ensure_dsv4_cache_tensors (llama-dsv4.cpp): ratios from hparams
+        // (V4 {4,128} = the values previously hardcoded here; V4.1 {2,1}), the LID
+        // cache sized to the smallest ratio (V4: min(4,128)=4=csa_ratio, so V4 stays
+        // byte-identical; V4.1: 1 = full-context), V4's overlap state width 2 vs
+        // V4.1's non-overlap 1, and V4.1's decoder index-source layers owning a LID
+        // cache despite being hca-ratio layers. Engram layers add nothing (their
+        // lookup/gate tensors are per-graph temps; the table is a model tensor).
+        const uint32_t csa_ratio = hparams.dsv4_csa_ratio;
+        const uint32_t hca_ratio = hparams.dsv4_hca_ratio;
+        const uint32_t lid_ratio = hparams.dsv4_lid_ratio;
         constexpr uint32_t cache_pad = 256;
+        const bool     csa_overlap      = arch == LLM_ARCH_DEEPSEEK4;
+        const uint32_t csa_state_width  = csa_overlap ? 2 : 1;
 
         const uint32_t n_stream = std::max<uint32_t>(1, n_seq_max);
         const uint32_t csa_kv = GGML_PAD(std::max<uint32_t>(1, (kv_size + csa_ratio - 1)/csa_ratio), cache_pad);
         const uint32_t hca_kv = GGML_PAD(std::max<uint32_t>(1, (kv_size + hca_ratio - 1)/hca_ratio), cache_pad);
+        const uint32_t lid_kv = GGML_PAD(std::max<uint32_t>(1, (kv_size + lid_ratio - 1)/lid_ratio), cache_pad);
         const uint32_t ratio = hparams.dsv4_compress_ratios[(size_t) il];
         const int64_t n_embd_head = hparams.n_embd_head_k(il);
         const int64_t n_indexer_head = hparams.indexer_head_size;
@@ -2796,12 +2807,17 @@ size_t llama_model::cache_size(int il, ggml_type type_k, ggml_type type_v, ggml_
         size_t size = ggml_row_size(type_k, n_embd_head) * hparams.n_head_kv(il) * k_rows;
         if (ratio == csa_ratio) {
             size += ggml_row_size(type_k, n_embd_head) * csa_kv * n_stream;
-            size += ggml_row_size(idx_type_k, n_indexer_head) * csa_kv * n_stream;
-            size += (size_t) 2 * n_embd_head * 2 * csa_ratio * n_stream * sizeof(float) * 2;
-            size += (size_t) 2 * n_indexer_head * 2 * csa_ratio * n_stream * sizeof(float) * 2;
+            size += ggml_row_size(idx_type_k, n_indexer_head) * lid_kv * n_stream;
+            size += (size_t) 2 * n_embd_head * csa_state_width * csa_ratio * n_stream * sizeof(float) * csa_state_width;
+            size += (size_t) 2 * n_indexer_head * csa_state_width * csa_ratio * n_stream * sizeof(float) * csa_state_width;
         } else if (ratio == hca_ratio) {
             size += ggml_row_size(type_k, n_embd_head) * hca_kv * n_stream;
             size += (size_t) n_embd_head * hca_ratio * n_stream * sizeof(float) * 2;
+            if (arch == LLM_ARCH_DEEPSEEK41 && hparams.dsv4_is_index_source[(size_t) il]) {
+                // V4.1 decoder index-source layers own a LID cache (see the allocator)
+                size += ggml_row_size(idx_type_k, n_indexer_head) * lid_kv * n_stream;
+                size += (size_t) 2 * n_indexer_head * csa_state_width * csa_ratio * n_stream * sizeof(float) * csa_state_width;
+            }
         }
         return size;
     }
