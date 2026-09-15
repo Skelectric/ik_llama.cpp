@@ -895,10 +895,42 @@ llama_context::~llama_context() {
 }
 
 static int llama_openpangu_chunked_graph_nodes(const llama_model & model, const llama_cparams & cparams, int n_tokens, int n_kv);
+static int64_t llama_div_ceil_i64(int64_t num, int64_t denom);
 
 int llama_context::max_nodes(int n_tokens, int n_kv) const {
     int max_nodes = model.max_nodes(n_tokens);
     max_nodes += llama_openpangu_chunked_graph_nodes(model, cparams, n_tokens, n_kv);
+    if (model.arch == LLM_ARCH_DEEPSEEK41 && n_tokens > 14 && n_kv > 0) {
+        // The unfused lightning-indexer score chunks over the token dim (see
+        // build_deepseek4.cpp); mirror its chunk math so the graph node budget
+        // covers the chunk loops. Keep the constants in sync with that file.
+        static constexpr int64_t DSV4_IDX_SCORE_CHUNK = 256;
+        static constexpr int64_t DSV4_IDX_KQ_MAX_MIB  = 512;
+        const llama_hparams & hp = model.hparams;
+        int64_t chunk = DSV4_IDX_SCORE_CHUNK;
+        while (chunk > 32 &&
+                (n_kv + 512)*chunk*std::max<int64_t>(1, hp.indexer_n_head)*(int64_t) sizeof(float) > (DSV4_IDX_KQ_MAX_MIB << 20)) {
+            chunk >>= 1;
+        }
+        if (chunk > 0 && n_tokens > chunk) {
+            const int64_t n_chunks = llama_div_ceil_i64(n_tokens, chunk);
+            int64_t n_unfused = 0;
+            if (hp.dsv4_candidate_source_layer >= 0 && hp.dsv4_candidate_block_size > 0 &&
+                    hp.dsv4_candidate_topk_blocks > 0 &&
+                    n_kv > hp.dsv4_candidate_topk_blocks*hp.dsv4_candidate_block_size) {
+                // the candidate pin is active, so the candidate source takes the unfused path
+                ++n_unfused;
+            }
+            if (!cparams.fused_idx_topk) {
+                int64_t n_src = 0;
+                for (bool is_src : hp.dsv4_is_index_source) {
+                    n_src += is_src ? 1 : 0;
+                }
+                n_unfused = std::max(n_unfused, n_src);
+            }
+            max_nodes += (int) (n_unfused * n_chunks * 12);
+        }
+    }
     if (model.is_mla_model() &&
         cparams.mla_attn > 1 &&
         n_tokens >= 128 &&

@@ -21,6 +21,15 @@ static ggml_tensor * dsv4_hc_mean_for_capture(ggml_context * ctx, ggml_tensor * 
     return ggml_scale(ctx, mean, 1.0f / (float) x->ne[1]);
 }
 
+// Token-chunk size for the unfused lightning-indexer score: bounds the per-chunk KQ
+// [n_lid, chunk, n_head] so it stays under the int32 element-count limit of the CUDA
+// cpy/RELU kernels and the GPU compute buffer. Halves adaptively (floor 32) as n_lid
+// grows so one chunk's KQ stays under DSV4_IDX_KQ_MAX_MIB. Mirrors
+// OPENPANGU_IDX_SCORE_CHUNK / GLM5NEXT_IDX_SCORE_CHUNK — keep in sync with the node
+// budget estimator in llama_context::max_nodes (llama.cpp).
+static constexpr int64_t DSV4_IDX_SCORE_CHUNK = 256;
+static constexpr int64_t DSV4_IDX_KQ_MAX_MIB  = 512;
+
 static float dsv4_rope_attn_factor(float freq_scale, float ext_factor) {
     if (ext_factor == 0.0f) {
         return 1.0f;
@@ -1058,20 +1067,55 @@ static ggml_tensor * dsv4_build_lid_top_k(
         }
     }
 
-    ggml_tensor * indexer_kq = ggml_mul_mat(ctx0, indexer_k, indexer_q);
-    llm.cb(indexer_kq, "lid_kq", il);
-
-    indexer_kq = ggml_cont(ctx0, ggml_permute(ctx0, indexer_kq, 2, 1, 0, 3));
-    llm.cb(indexer_kq, "lid_kq_perm", il);
-
-    ggml_tensor * indexer_score = ggml_relu(ctx0, indexer_kq);
-    indexer_score = ggml_mul(ctx0, indexer_score, indexer_weights);
-    indexer_score = ggml_sum_rows(ctx0, indexer_score);
-    indexer_score = ggml_cont(ctx0, ggml_permute(ctx0, indexer_score, 2, 1, 0, 3));
-    llm.cb(indexer_score, "lid_score", il);
-
-    indexer_score = ggml_add(ctx0, indexer_score, lid_mask);
-    llm.cb(indexer_score, "lid_score_masked", il);
+    // Unfused score: relu(KQ) weighted per head, summed over heads, plus the group
+    // mask. Computed in token chunks when the batch is large: the per-head KQ
+    // [n_lid, n_tokens, n_head] is the largest intermediate in the graph (it scales
+    // with context x batch — 9+ GiB at 16k+ context with a multi-thousand-token
+    // batch), and past 2^31 elements the CUDA cpy kernels' int32 element count
+    // overflows (observed abort: invalid configuration at the candidate-source
+    // layer with n_lid = 20480, n_tokens = 3550). The chunk size halves adaptively
+    // so one chunk's KQ stays under DSV4_IDX_KQ_MAX_MIB. Per-chunk scores
+    // concatenate along the token dim; top-k and the candidate-source pooling are
+    // per-column, so the chunked result is exact.
+    int64_t idx_chunk = DSV4_IDX_SCORE_CHUNK;
+    const int64_t n_tok_dim = indexer_q->ne[1];
+    while (idx_chunk > 32 &&
+            n_lid*idx_chunk*n_indexer_head*n_stream*(int64_t) sizeof(float) > (DSV4_IDX_KQ_MAX_MIB << 20)) {
+        idx_chunk >>= 1;
+    }
+    auto dsv4_build_score_chunk = [&](int64_t c0, int64_t tc) {
+        auto q_c = ggml_cont(ctx0, ggml_view_4d(ctx0, indexer_q,
+                indexer_q->ne[0], tc, indexer_q->ne[2], indexer_q->ne[3],
+                indexer_q->nb[1], indexer_q->nb[2], indexer_q->nb[3], (size_t) c0*indexer_q->nb[1]));
+        auto w_c = ggml_view_4d(ctx0, indexer_weights,
+                indexer_weights->ne[0], tc, indexer_weights->ne[2], indexer_weights->ne[3],
+                indexer_weights->nb[1], indexer_weights->nb[2], indexer_weights->nb[3],
+                (size_t) c0*indexer_weights->nb[1]);
+        auto kq_c = ggml_mul_mat(ctx0, indexer_k, q_c);
+        kq_c = ggml_cont(ctx0, ggml_permute(ctx0, kq_c, 2, 1, 0, 3));
+        auto sc_c = ggml_relu(ctx0, kq_c);
+        sc_c = ggml_mul(ctx0, sc_c, w_c);
+        sc_c = ggml_sum_rows(ctx0, sc_c);
+        sc_c = ggml_cont(ctx0, ggml_permute(ctx0, sc_c, 2, 1, 0, 3));
+        auto m_c = ggml_view_4d(ctx0, lid_mask,
+                lid_mask->ne[0], tc, lid_mask->ne[2], lid_mask->ne[3],
+                lid_mask->nb[1], lid_mask->nb[2], lid_mask->nb[3], (size_t) c0*lid_mask->nb[1]);
+        return ggml_add(ctx0, sc_c, m_c);
+    };
+    ggml_tensor * indexer_score = nullptr;
+    if (idx_chunk <= 0 || n_tok_dim <= idx_chunk) {
+        // small batch (decode or short prefill): one shot, no concat
+        indexer_score = dsv4_build_score_chunk(0, n_tok_dim);
+        llm.cb(indexer_score, "lid_score_masked", il);
+    } else {
+        for (int64_t c0 = 0; c0 < n_tok_dim; c0 += idx_chunk) {
+            const int64_t tc = std::min(idx_chunk, n_tok_dim - c0);
+            auto sc_c = dsv4_build_score_chunk(c0, tc);
+            llm.cb(sc_c, "lid_score_chunk", il);
+            indexer_score = indexer_score == nullptr ? sc_c : ggml_concat(ctx0, indexer_score, sc_c, 1);
+        }
+        llm.cb(indexer_score, "lid_score_masked", il);
+    }
 
     if (is_cand_source) {
         // publish the block-level candidate selection for every later index source
