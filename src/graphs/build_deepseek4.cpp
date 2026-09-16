@@ -1437,6 +1437,18 @@ static ggml_tensor * ds4_attention(ggml_cgraph * gf, ggml_context * ctx0, llm_bu
         int ntokens = std::max(k_fa_chunk, int(q->ne[2]));
         int nton = k_fa_chunk*((ntokens + n_swa + k_fa_chunk - 1)/k_fa_chunk);
         int first = raw_k->ne[2] - nton;
+        // The raw K tensor is padded up to a multiple of 256 rows and those padding rows repeat the
+        // last valid row (their mask entries stay -INFINITY). Anchoring the window to the padded end
+        // therefore shifts it forward: with n_kv=75280 (padded 75520) and nton=4352 the window starts
+        // at row 71168 while the batch's first token is row 71109, so the batch's first 59 tokens fall
+        // outside their own window. All of their mask columns are then future rows, the row comes out
+        // entirely -INFINITY, and the fused softmax returns NaN (exp(-inf - (-inf))) -> NaN logits.
+        // Anchor to the last *valid* row instead, so the window covers [n_valid - nton, n_valid).
+        const int64_t n_valid = lctx.dsv4.raw.n_kv > 0 ? lctx.dsv4.raw.n_kv : raw_k->ne[2];
+        if (n_valid < raw_k->ne[2]) {
+            first -= (int) (raw_k->ne[2] - n_valid);
+            if (first < 0) { first = 0; }
+        }
         if (first > 0) {
             raw_k = ggml_view_4d(ctx0, raw_k, raw_k->ne[0], raw_k->ne[1], nton, raw_k->ne[3],
                     raw_k->nb[1], raw_k->nb[2], raw_k->nb[3], raw_k->nb[2]*first);
