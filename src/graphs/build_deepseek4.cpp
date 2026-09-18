@@ -1973,7 +1973,35 @@ ggml_cgraph * llm_build_context::build_deepseek41() {
     dsv4_build_plan_inputs(ctx0, lctx.dsv4.inputs.lid, lctx.dsv4.lid_plan, "dsv4_lid", n_tokens, false, lctx.cparams.flash_attn);
 
     ggml_tensor * inp_pos = build_inp_pos();
-    ggml_tensor * KQ_mask = hparams.n_swa > 0 ? build_inp_KQ_mask_swa() : build_inp_KQ_mask();
+
+    // V4.1's GGUF has block_count = backbone only (no MTP blocks in the file);
+    // the hparams loader probes for blk.{n_layer} tensors and zeroes
+    // nextn_predict_layers when they are absent, so this V4-convention formula
+    // yields the full backbone layer count (n_layer - 0).
+    const int n_layer_end = n_layer - hparams.nextn_predict_layers;
+
+    // Mask wiring, mirroring build_deepseek4: with --swa-compress every V4.1 layer is a
+    // compacted SWA layer, so ds4_attention reads K through the window view and needs the
+    // column-exact compacted mask. This builder used to pass nullptr and never set
+    // lctx.swa_window_view, which tripped the raw_compacted assert at build_deepseek4.cpp:1397.
+    ggml_tensor * KQ_mask = nullptr;
+    ggml_tensor * KQ_mask_swa_win = nullptr;
+    if (kv_self.any_compacted()) {
+        bool walked_compacted = false, walked_dense = false;
+        for (int il = 0; il < n_layer_end; ++il) {
+            (kv_self.is_compacted(il) ? walked_compacted : walked_dense) = true;
+        }
+        if (walked_compacted) {
+            bool KQ_mask_swa_windowed = false;
+            KQ_mask_swa_win = build_swa_mask_for_graph(hparams.n_swa, /* compacted = */ true, &KQ_mask_swa_windowed);
+            GGML_ASSERT(KQ_mask_swa_windowed && KQ_mask_swa_win != nullptr);
+        }
+        if (walked_dense) {
+            KQ_mask = hparams.n_swa > 0 ? build_inp_KQ_mask_swa() : build_inp_KQ_mask();
+        }
+    } else {
+        KQ_mask = hparams.n_swa > 0 ? build_inp_KQ_mask_swa() : build_inp_KQ_mask();
+    }
 
     ggml_tensor * append_csa_state = nullptr;
     ggml_tensor * append_csa_score = nullptr;
@@ -1985,12 +2013,6 @@ ggml_cgraph * llm_build_context::build_deepseek41() {
     inpL = ggml_reshape_3d(ctx0, inp, n_embd, 1, n_tokens);
     inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
     cb(inpL, "hc_init", -1);
-
-    // V4.1's GGUF has block_count = backbone only (no MTP blocks in the file);
-    // the hparams loader probes for blk.{n_layer} tensors and zeroes
-    // nextn_predict_layers when they are absent, so this V4-convention formula
-    // yields the full backbone layer count (n_layer - 0).
-    const int n_layer_end = n_layer - hparams.nextn_predict_layers;
 
     // V4.1 cross-layer top-k carry: an index-source layer publishes the top-k it
     // picked; Reuse layers after it consume it instead of re-running the indexer.
@@ -2049,7 +2071,7 @@ ggml_cgraph * llm_build_context::build_deepseek41() {
         inpL = ds4_attention(gf, ctx0, *this, inpL,
                 &append_csa_state, &append_csa_score,
                 &append_lid_state, &append_lid_score,
-                inp_pos, KQ_mask, nullptr, il, &topk_carry, hc_carry, cand_carry);
+                inp_pos, KQ_mask, KQ_mask_swa_win, il, &topk_carry, hc_carry, cand_carry);
 
         // ---- MoE FFN ----
         ggml_tensor * residual = inpL;
