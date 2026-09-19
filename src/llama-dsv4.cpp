@@ -18,16 +18,41 @@
 #include <type_traits>
 #include <unordered_set>
 
-static bool dsv4_cache_type_supported(ggml_type type) {
-    return type == GGML_TYPE_F16 || type == GGML_TYPE_BF16 || type == GGML_TYPE_Q8_0;
+// Phase 4 packed KV-cache storage types (plan §3.2) are site-typed: the compressed
+// (main) KV is fp4 blk 16 with an E4M3 scale, the indexer K is fp4 blk 32 with an E8M0
+// scale, and the sliding window is fp8 blk 32 with an E8M0 scale. A packed type is
+// accepted only for the site it belongs to, so a swapped -ctk/-ictk is refused here
+// instead of silently quantising with the wrong rule. The packed names are only
+// reachable when --packed-kv-cache is set (the parse-time gate in kv_cache_type_from_str
+// already refuses them otherwise), but the flag is re-checked here so a programmatic
+// caller cannot bypass it.
+enum dsv4_cache_site {
+    DSV4_CACHE_SITE_MAIN,    // raw/CSA/HCA compressed K
+    DSV4_CACHE_SITE_INDEXER, // LID indexer K
+};
+
+static bool dsv4_cache_type_supported(ggml_type type, dsv4_cache_site site, bool packed_kv_cache) {
+    if (type == GGML_TYPE_F16 || type == GGML_TYPE_BF16 || type == GGML_TYPE_Q8_0) {
+        return true;
+    }
+    if (!packed_kv_cache) {
+        return false;
+    }
+    switch (site) {
+        case DSV4_CACHE_SITE_MAIN:
+            return type == GGML_TYPE_FP4_B16_E4M3 || type == GGML_TYPE_FP8_B32_E8M0;
+        case DSV4_CACHE_SITE_INDEXER:
+            return type == GGML_TYPE_FP4_B32_E8M0;
+    }
+    return false;
 }
 
 // Per-step capture is limited to the eight-row CSA/LID ring.
 // TODO: Expand to a larger number
 static constexpr int DSV4_PER_STEP_MAX_STATE_ROWS = 8;
 
-static bool dsv4_validate_cache_type(ggml_type type, int64_t width, const char * name) {
-    if (!dsv4_cache_type_supported(type)) {
+static bool dsv4_validate_cache_type(ggml_type type, int64_t width, const char * name, dsv4_cache_site site, bool packed_kv_cache) {
+    if (!dsv4_cache_type_supported(type, site, packed_kv_cache)) {
         LLAMA_LOG_ERROR("%s: unsupported DSV4 %s cache type %s\n", __func__, name, ggml_type_name(type));
         return false;
     }
@@ -946,8 +971,8 @@ bool llama_context::ensure_dsv4_cache_tensors() {
     // decoder index keys (different block counts) fit in the shared lid cache.
     const uint32_t lid_kv = GGML_PAD(dsv4_comp_size(cparams.n_ctx, lid_ratio), 256u);
 
-    if (!dsv4_validate_cache_type(kv_self.type_k, n_embd_head, "raw/CSA/HCA") ||
-        !dsv4_validate_cache_type(cparams.idx_type_k, n_indexer_head, "LID")) {
+    if (!dsv4_validate_cache_type(kv_self.type_k, n_embd_head, "raw/CSA/HCA", DSV4_CACHE_SITE_MAIN, cparams.packed_kv_cache) ||
+        !dsv4_validate_cache_type(cparams.idx_type_k, n_indexer_head, "LID", DSV4_CACHE_SITE_INDEXER, cparams.packed_kv_cache)) {
         return false;
     }
 

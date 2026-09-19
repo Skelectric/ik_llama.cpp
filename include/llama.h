@@ -436,6 +436,7 @@ extern "C" {
         bool defer_ple;        // keep the per-layer token embedding on the file instead of resident in memory (Linux only)
         bool defer_engram;     // keep the engram tables on the file instead of resident in memory (Linux only)
         bool swa_compress;     // must match llama_context_params::swa_compress; the fit also assumes that context's n_ubatch
+        bool packed_kv_cache;  // must match llama_context_params::packed_kv_cache
     };
 
     // NOTE: changing the default values of parameters marked as [EXPERIMENTAL] may cause crashes or incorrect results in certain configurations
@@ -498,6 +499,7 @@ extern "C" {
         bool dsa;               // enable GLM DSA sparse attention (off by default) [EXPERIMENTAL]
         bool fused_idx_topk;    // enable the fused indexer topk op (off by default) [EXPERIMENTAL]
         bool swa_compress;      // allocate sliding-window layers at window size instead of n_ctx (off by default) [EXPERIMENTAL]
+        bool packed_kv_cache;   // enable the packed fp4/fp8 KV-cache storage types (DeepSeek-V4 family only; off by default) [EXPERIMENTAL]
         int  dsa_top_k;         // DSA top-k override (<0 => model's configured indexer_top_k) [EXPERIMENTAL]
         int  min_experts;
         float thresh_experts;

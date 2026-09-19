@@ -1279,6 +1279,10 @@ static bool llama_kv_cache_init(
         }
     }
 
+    if (cparams.packed_kv_cache && !model.supports_packed_kv_cache()) {
+        LLAMA_LOG_WARN("%s: --packed-kv-cache is not implemented for this model; ignoring\n", __func__);
+    }
+
     cache.type_k  = type_k;
     cache.type_v  = type_v;
 
@@ -4484,6 +4488,7 @@ static bool llm_load_tensors(
         int worst_case_tokens,
         bool flash_attn,
         bool swa_compress,
+        bool packed_kv_cache,
         bool use_mlock,
         bool validate_quants,
         bool mtp,
@@ -4582,6 +4587,7 @@ static bool llm_load_tensors(
     model.n_gpu_layers = n_gpu_layers;
     model.mtp          = mtp;
     model.swa_compress = swa_compress;
+    model.packed_kv_cache = packed_kv_cache;
 
     size_t mem_margin  = fit_margin > 0 ? size_t(fit_margin)*1024*1024 : k_default_mem_margin;
     auto get_mem_margin = [mem_margin, fit_margin_array, n_gpu = int(model.devices.size()), func = __func__] (int gpu) {
@@ -5393,7 +5399,7 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
             ml, model, params.n_gpu_layers, params.mla, params.split_mode, params.main_gpu, params.max_gpu, params.tensor_split,
             params.type_k, params.type_v, params.idx_type_k, params.extra_output_type,
             params.max_ctx_size, params.n_seq_max, params.n_ubatch, params.amb, params.fit_margin, params.fit_margin_array,
-            params.worst_graph_tokens, params.flash_attn, params.swa_compress,
+            params.worst_graph_tokens, params.flash_attn, params.swa_compress, params.packed_kv_cache,
             params.use_mlock, params.validate_quants, params.mtp, params.fit, params.dry_run,
             params.progress_callback, params.progress_callback_user_data
         )) {
@@ -8411,6 +8417,7 @@ struct llama_model_params llama_model_default_params() {
         /*.defer_ple                   =*/ false,
         /*.defer_engram                =*/ false,
         /*.swa_compress                =*/ false,
+        /*.packed_kv_cache             =*/ false,
     };
 
 #ifdef GGML_USE_METAL
@@ -8473,6 +8480,7 @@ struct llama_context_params llama_context_default_params() {
         /*.dsa                         =*/ false,
         /*.fused_idx_topk              =*/ true,
         /*.swa_compress                =*/ false,
+        /*.packed_kv_cache             =*/ false,
         /*.dsa_top_k                   =*/ -1,
         /*.min_experts                 =*/ -1,
         /*.thtesh_experts              =*/ 0.0f,
@@ -8887,8 +8895,9 @@ struct llama_context * llama_init_from_model(
     }
 
     if (llm_arch_is_dsv4(model->arch) &&
-            params.type_k != GGML_TYPE_F16 && params.type_k != GGML_TYPE_BF16 && params.type_k != GGML_TYPE_Q8_0) {
-        LLAMA_LOG_ERROR("%s: DeepSeek V4/V4.1 K-cache supports only F16, BF16, and Q8_0 (requested %s)\n",
+            params.type_k != GGML_TYPE_F16 && params.type_k != GGML_TYPE_BF16 && params.type_k != GGML_TYPE_Q8_0 &&
+            !(params.packed_kv_cache && llama_is_packed_kv_cache_type(params.type_k))) {
+        LLAMA_LOG_ERROR("%s: DeepSeek V4/V4.1 K-cache supports only F16, BF16, and Q8_0 (or a packed type with --packed-kv-cache) (requested %s)\n",
                         __func__, ggml_type_name(params.type_k));
         return nullptr;
     }
@@ -8964,12 +8973,20 @@ struct llama_context * llama_init_from_model(
     cparams.dsa              = params.dsa;
     cparams.fused_idx_topk   = params.fused_idx_topk;
     cparams.swa_compress     = params.swa_compress;
+    cparams.packed_kv_cache  = params.packed_kv_cache;
     cparams.dsa_top_k        = params.dsa_top_k;
 
     if (cparams.swa_compress != model->swa_compress) {
         LLAMA_LOG_ERROR("%s: swa_compress differs between llama_model_params (%d) and llama_context_params (%d); "
                         "the cache-size fit would not match the allocation\n",
                         __func__, (int) model->swa_compress, (int) cparams.swa_compress);
+        llama_free(ctx);
+        return nullptr;
+    }
+    if (cparams.packed_kv_cache != model->packed_kv_cache) {
+        LLAMA_LOG_ERROR("%s: packed_kv_cache differs between llama_model_params (%d) and llama_context_params (%d); "
+                        "the cache-size fit would not match the allocation\n",
+                        __func__, (int) model->packed_kv_cache, (int) cparams.packed_kv_cache);
         llama_free(ctx);
         return nullptr;
     }
@@ -9006,6 +9023,20 @@ struct llama_context * llama_init_from_model(
     cparams.reduce_type      = params.type_reduce;
     cparams.graph_attn_precision = params.type_graph_attn;
     cparams.idx_type_k       = params.idx_type_k;
+    // The packed storage types are implemented for the DeepSeek-V4 family (and its dflash
+    // draft) only. Refuse them everywhere else rather than letting an unknown cache type
+    // reach a compute op, which would abort deep inside a kernel.
+    if (llama_is_packed_kv_cache_type(params.type_k) ||
+        llama_is_packed_kv_cache_type(params.type_v) ||
+        llama_is_packed_kv_cache_type(params.idx_type_k)) {
+        if (!cparams.packed_kv_cache || !model->supports_packed_kv_cache()) {
+            LLAMA_LOG_ERROR("%s: packed KV-cache types require --packed-kv-cache on a supported model (DeepSeek-V4 family); requested %s/%s/%s\n",
+                            __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v),
+                            ggml_type_name(params.idx_type_k));
+            llama_free(ctx);
+            return nullptr;
+        }
+    }
     if (cparams.graph_attn_precision != GGML_TYPE_F16 && cparams.graph_attn_precision != GGML_TYPE_F32) {
         throw std::runtime_error(format("--graph-attn-precision must be f16 or f32, got %s",
                                         ggml_type_name(cparams.graph_attn_precision)));

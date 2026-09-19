@@ -15,6 +15,14 @@
 
 #include "llama-reload-info.h"
 
+// Phase 4 packed KV-cache storage types (ggml ids 400-402). They are storage-only:
+// written through set_rows and read back through get_rows, never a compute operand.
+static inline bool llama_is_packed_kv_cache_type(ggml_type type) {
+    return type == GGML_TYPE_FP4_B16_E4M3 ||
+           type == GGML_TYPE_FP4_B32_E8M0 ||
+           type == GGML_TYPE_FP8_B32_E8M0;
+}
+
 // available llama models
 enum e_model {
     MODEL_UNKNOWN,
@@ -589,6 +597,7 @@ struct llama_model {
 
     bool mtp; // use mtp if is supported by the Model
     bool swa_compress = false; // value the cache-size fit was computed with
+    bool packed_kv_cache = false; // must match llama_context_params::packed_kv_cache
 
     std::vector<rpc_device> rpc_servers;
     std::vector<int32_t> devices;
@@ -691,6 +700,12 @@ struct llama_model {
         return arch == LLM_ARCH_OPENPANGU || llm_arch_is_dsv4(arch)
             || arch == LLM_ARCH_LAGUNA    || arch == LLM_ARCH_GEMMA4
             || supports_dflash_swa_compress() ;
+    }
+
+    // The packed fp4/fp8 KV-cache storage types are implemented for the DeepSeek-V4
+    // family (compressed + indexer caches) and for the dflash draft window (plan §6.2).
+    bool supports_packed_kv_cache() const {
+        return llm_arch_is_dsv4(arch) || llm_arch_is_dflash_family(arch);
     }
 
     static inline int hadamard_size(int head_size) {

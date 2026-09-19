@@ -1943,6 +1943,10 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.swa_compress = true;
         return true;
     }
+    if (arg == "--packed-kv-cache") {
+        params.packed_kv_cache = true;
+        return true;
+    }
     if (arg == "-dsatk" || arg == "--dsa-top-k") {
         CHECK_ARG
         params.dsa_top_k = std::stoi(argv[i]);
@@ -3086,6 +3090,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "-dsa,  --dsa",                  "enable GLM DSA sparse attention (GLM-DSA arch only; default: %s)", params.dsa ? "enabled" : "disabled" });
     options.push_back({ "*",           "-fidx,  --fused-indexer-topk",  "enable the fused indexer topk op (DSA only; default: %s)", params.fused_idx_topk ? "enabled" : "disabled" });
     options.push_back({ "*",           "        --swa-compress",         "allocate sliding-window layers at window size instead of n_ctx (default: %s)", params.swa_compress ? "enabled" : "disabled" });
+    options.push_back({ "*",           "        --packed-kv-cache",       "enable the packed fp4/fp8 KV-cache storage types (DeepSeek-V4 family only; default: %s)", params.packed_kv_cache ? "enabled" : "disabled" });
     options.push_back({ "*",           "-dsatk, --dsa-top-k",           "DSA top-k override; <0 uses the model's configured indexer_top_k (default: %d)", params.dsa_top_k });
     options.push_back({ "*",           "-amb,  --attention-max-batch",  "max batch size for attention computations (default: %d)", params.attn_max_batch});
     options.push_back({ "*",           "-no-fmoe, --no-fused-moe",      "disable fused MoE (default: %s)", params.fused_moe_up_gate ? "enabled" : "disabled" });
@@ -4186,7 +4191,7 @@ void llama_lora_adapters_apply(struct llama_context * ctx, std::vector<llama_lor
     }
 }
 
-static ggml_type kv_cache_type_from_str(const std::string & s) {
+static ggml_type kv_cache_type_from_str(const std::string & s, bool packed_kv_cache) {
     if (s == "f32") {
         return GGML_TYPE_F32;
     }
@@ -4219,6 +4224,27 @@ static ggml_type kv_cache_type_from_str(const std::string & s) {
     }
     if (s == "q8_KV") {
         return GGML_TYPE_Q8_KV;
+    }
+    // Phase 4 packed KV-cache storage types. They are only reachable with
+    // --packed-kv-cache, so a plain -ctk/-ctv/-ictk cannot silently switch the
+    // default path onto a packed layout (G6).
+    if (s == "fp4_B16_E4M3") {
+        if (!packed_kv_cache) {
+            throw std::runtime_error("Cache type fp4_B16_E4M3 requires --packed-kv-cache");
+        }
+        return GGML_TYPE_FP4_B16_E4M3;
+    }
+    if (s == "fp4_B32_E8M0") {
+        if (!packed_kv_cache) {
+            throw std::runtime_error("Cache type fp4_B32_E8M0 requires --packed-kv-cache");
+        }
+        return GGML_TYPE_FP4_B32_E8M0;
+    }
+    if (s == "fp8_B32_E8M0") {
+        if (!packed_kv_cache) {
+            throw std::runtime_error("Cache type fp8_B32_E8M0 requires --packed-kv-cache");
+        }
+        return GGML_TYPE_FP8_B32_E8M0;
     }
 
     throw std::runtime_error("Invalid cache type: " + s);
@@ -4261,13 +4287,13 @@ struct llama_model_params common_model_params_to_llama(const gpt_params & params
     mparams.fit             = params.fit;
     mparams.fit_margin      = params.fit_margin;
     mparams.worst_graph_tokens = params.worst_graph_tokens;
-    mparams.type_k          = kv_cache_type_from_str(params.cache_type_k);
-    mparams.type_v          = kv_cache_type_from_str(params.cache_type_v);
-    mparams.idx_type_k      = kv_cache_type_from_str(params.indexer_cache_type_k);
-    mparams.type_k_first    = kv_cache_type_from_str(params.type_k_first);
-    mparams.type_k_last     = kv_cache_type_from_str(params.type_k_last );
-    mparams.type_v_first    = kv_cache_type_from_str(params.type_v_first);
-    mparams.type_v_last     = kv_cache_type_from_str(params.type_v_last );
+    mparams.type_k          = kv_cache_type_from_str(params.cache_type_k, params.packed_kv_cache);
+    mparams.type_v          = kv_cache_type_from_str(params.cache_type_v, params.packed_kv_cache);
+    mparams.idx_type_k      = kv_cache_type_from_str(params.indexer_cache_type_k, params.packed_kv_cache);
+    mparams.type_k_first    = kv_cache_type_from_str(params.type_k_first, params.packed_kv_cache);
+    mparams.type_k_last     = kv_cache_type_from_str(params.type_k_last, params.packed_kv_cache);
+    mparams.type_v_first    = kv_cache_type_from_str(params.type_v_first, params.packed_kv_cache);
+    mparams.type_v_last     = kv_cache_type_from_str(params.type_v_last, params.packed_kv_cache);
     if (!params.extra_output_type.empty()) {
         mparams.extra_output_type = parse_ggml_type(params.extra_output_type.c_str());
     }
@@ -4295,6 +4321,7 @@ struct llama_model_params common_model_params_to_llama(const gpt_params & params
     mparams.defer_ple       = params.defer_ple;
     mparams.defer_engram    = params.defer_engram;
     mparams.swa_compress    = params.swa_compress;
+    mparams.packed_kv_cache = params.packed_kv_cache;
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;
     } else {
@@ -4376,6 +4403,7 @@ struct llama_context_params common_context_params_to_llama(const gpt_params & pa
     cparams.dsa               = params.dsa;
     cparams.fused_idx_topk    = params.fused_idx_topk;
     cparams.swa_compress      = params.swa_compress;
+    cparams.packed_kv_cache   = params.packed_kv_cache;
     cparams.dsa_top_k         = params.dsa_top_k;
     cparams.k_cache_hadamard  = params.k_cache_hadamard;
     cparams.v_cache_hadamard  = params.v_cache_hadamard;
@@ -4391,18 +4419,18 @@ struct llama_context_params common_context_params_to_llama(const gpt_params & pa
     cparams.mtp               = params.has_mtp || params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP);
     cparams.mtp_op_type      = MTP_OP_NONE;
 
-    cparams.type_k = kv_cache_type_from_str(params.cache_type_k);
-    cparams.type_v = kv_cache_type_from_str(params.cache_type_v);
-    cparams.idx_type_k = kv_cache_type_from_str(params.indexer_cache_type_k);
+    cparams.type_k = kv_cache_type_from_str(params.cache_type_k, params.packed_kv_cache);
+    cparams.type_v = kv_cache_type_from_str(params.cache_type_v, params.packed_kv_cache);
+    cparams.idx_type_k = kv_cache_type_from_str(params.indexer_cache_type_k, params.packed_kv_cache);
     cparams.type_reduce = ggml_type_from_str(params.reduce_type);
     cparams.type_graph_attn = ggml_type_from_str(params.graph_attn_precision);
     if (!cparams.flash_attn && ggml_is_quantized(cparams.type_v)) {
         throw std::runtime_error("Quantized V cache cannot be used without flash attention");
     }
-    cparams.type_k_first    = kv_cache_type_from_str(params.type_k_first);
-    cparams.type_k_last     = kv_cache_type_from_str(params.type_k_last );
-    cparams.type_v_first    = kv_cache_type_from_str(params.type_v_first);
-    cparams.type_v_last     = kv_cache_type_from_str(params.type_v_last );
+    cparams.type_k_first    = kv_cache_type_from_str(params.type_k_first, params.packed_kv_cache);
+    cparams.type_k_last     = kv_cache_type_from_str(params.type_k_last, params.packed_kv_cache);
+    cparams.type_v_first    = kv_cache_type_from_str(params.type_v_first, params.packed_kv_cache);
+    cparams.type_v_last     = kv_cache_type_from_str(params.type_v_last, params.packed_kv_cache);
     cparams.n_k_first       = params.n_k_first;
     cparams.n_k_last        = params.n_k_last;
     cparams.n_v_first       = params.n_v_first;

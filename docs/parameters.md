@@ -91,6 +91,7 @@ Some often used terms.
 | `--indexer-cache-type-k type, -ictk` | Indexer K-cache data type | off | Use quantized indexer cache [PR 2075](https://github.com/ikawrakow/ik_llama.cpp/pull/2075) |
 | `--fused-indexer-topk, -fidx` | Enable the fused indexer topk op | disabled | Use a dedicated op for computing the DSA indexer top_k KV cache entries [PR 2098](https://github.com/ikawrakow/ik_llama.cpp/pull/2098) |
 | `--swa-compress` | Allocate sliding-window layers at window size instead of `n_ctx` | disabled | [PR 2266](https://github.com/ikawrakow/ik_llama.cpp/pull/2266) |
+| `--packed-kv-cache` | Enable the packed fp4/fp8 KV-cache storage types | disabled | DeepSeek-V4 family only. Without it, `-ctk`/`-ctv`/`-ictk` refuse the names `fp4_B16_E4M3`, `fp4_B32_E8M0`, and `fp8_B32_E8M0`. |
 | `-amb, --attention-max-batch` | Max batch size for attention computations | 256 | Specifies the maximum K*Q size in MB we want to tolerate. Default changed from 0 to 256 in [PR 2312](https://github.com/ikawrakow/ik_llama.cpp/pull/2312) to avoid very large temporary compute buffers on MLA models. [PR 237](https://github.com/ikawrakow/ik_llama.cpp/pull/237) |
 | `-fmoe or --fused-moe` | Fused MoE ffn_up and ffn_gate | - | Speedup for MoE models. [PR 229](https://github.com/ikawrakow/ik_llama.cpp/pull/229) |
 | `--no-fmoe, --no-fused-moe` | Disable fused MoE | enabled | See `--fused-moe` |

@@ -432,6 +432,7 @@ struct gpt_params {
     bool dsa               = false; // enable GLM DSA sparse attention (off by default; opt-in via --dsa)
     bool fused_idx_topk    = true;  // enable the fused indexer topk op (off by default; opt-in via -fidx or --fused-indexer-topk)
     bool swa_compress      = false;
+    bool packed_kv_cache   = false; // enable the packed fp4/fp8 KV-cache storage types (DeepSeek-V4 family only)
     int  dsa_top_k         = -1;    // DSA top-k override (<0 => use the model's configured indexer_top_k)
     int  min_experts       = -1;
     float thresh_experts   = 0;
