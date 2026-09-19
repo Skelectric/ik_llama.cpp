@@ -192,6 +192,36 @@ typedef struct {
 } block_mxfp4_r8;
 static_assert(sizeof(block_mxfp4_r8) == 8*sizeof(block_mxfp4), "wrong mxfp4_r8 block size/padding");
 
+// Phase 4 (DeepSeek-V4.1) packed KV-cache storage types.
+//
+// One scale byte per block, then the codes. The e2m1 codes are packed two per
+// byte in the *reference* order (element 2j in the low nibble, element 2j+1 in
+// the high one - torch.float4_e2m1fn_x2), so a packed block is comparable with
+// the reference's own packed output.
+//
+// Note that these blocks are odd-sized (9, 17 and 33 bytes), exactly like
+// block_mxfp4 above (17 bytes).
+#define QK_FP4_B16 16
+typedef struct {
+    uint8_t d;                 // E4M3 scale
+    uint8_t qs[QK_FP4_B16/2];  // e2m1 codes, 2 per byte
+} block_fp4_b16_e4m3;
+static_assert(sizeof(block_fp4_b16_e4m3) == sizeof(uint8_t) + QK_FP4_B16/2, "wrong fp4_b16_e4m3 block size/padding");
+
+#define QK_FP4_B32 32
+typedef struct {
+    uint8_t d;                 // E8M0 scale
+    uint8_t qs[QK_FP4_B32/2];  // e2m1 codes, 2 per byte
+} block_fp4_b32_e8m0;
+static_assert(sizeof(block_fp4_b32_e8m0) == sizeof(uint8_t) + QK_FP4_B32/2, "wrong fp4_b32_e8m0 block size/padding");
+
+#define QK_FP8_B32 32
+typedef struct {
+    uint8_t d;                 // E8M0 scale
+    uint8_t qs[QK_FP8_B32];    // e4m3 codes, 1 per byte
+} block_fp8_b32_e8m0;
+static_assert(sizeof(block_fp8_b32_e8m0) == sizeof(uint8_t) + QK_FP8_B32, "wrong fp8_b32_e8m0 block size/padding");
+
 #define QK5_0 32
 typedef struct {
     ggml_half d;           // delta
