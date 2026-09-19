@@ -19,6 +19,7 @@
 // Output line:  <type_name> <n> <scales_hex> <packed_hex> <y0_bits> ...
 
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "ggml-kv-quants.h"
 
 #include <cmath>
@@ -378,6 +379,135 @@ static int emit(const char * corpus_path, const char * out_path) {
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// backend mode: the same corpus, but through ggml_set_rows / ggml_get_rows on
+// a real backend. The cache row is written with set_rows and read back with
+// get_rows - exactly what Phase 4 does - so one run covers both the backend's
+// write side (the destination bytes) and its read side (the F32 output).
+//
+//   test-kv-quants CORPUS OUT --backend CUDA0
+//
+// The output format is the one emit() writes, so the same oracle driver diffs
+// the CPU type_traits path, the CPU backend and the CUDA backend against the
+// same reference vectors.
+// ---------------------------------------------------------------------------
+
+static int emit_backend(const char * corpus_path, const char * out_path, const char * backend_name) {
+    // the registry name is the family ("CUDA"), the backend name the device
+    // ("CUDA0"), so accept either
+    ggml_backend_t backend = NULL;
+    for (size_t i = 0; i < ggml_backend_reg_get_count(); ++i) {
+        ggml_backend_t b = ggml_backend_reg_init_backend(i, NULL);
+        if (b == NULL) {
+            continue;
+        }
+        if (strcmp(ggml_backend_reg_get_name(i), backend_name) == 0 ||
+            strcmp(ggml_backend_name(b), backend_name) == 0) {
+            backend = b;
+            break;
+        }
+        ggml_backend_free(b);
+    }
+    if (!backend) {
+        fprintf(stderr, "no backend named %s\n", backend_name);
+        return 2;
+    }
+    printf("backend %s\n", ggml_backend_name(backend));
+
+    std::ifstream in(corpus_path);
+    if (!in) {
+        fprintf(stderr, "cannot open %s\n", corpus_path);
+        return 2;
+    }
+    std::ofstream out(out_path);
+    if (!out) {
+        fprintf(stderr, "cannot write %s\n", out_path);
+        return 2;
+    }
+
+    std::string line;
+    int ncase = 0;
+    while (std::getline(in, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream ss(line);
+        std::string name;
+        int64_t n = 0;
+        if (!(ss >> name >> n) || n <= 0) {
+            fprintf(stderr, "bad corpus line: %s\n", line.c_str());
+            return 2;
+        }
+        const kv_type * t = find_type(name);
+        if (!t) {
+            fprintf(stderr, "unknown type %s\n", name.c_str());
+            return 2;
+        }
+        if (n % t->block != 0) {
+            fprintf(stderr, "%s: n=%lld is not a multiple of %d\n", name.c_str(), (long long)n, t->block);
+            return 2;
+        }
+        std::vector<float> x(n);
+        for (int64_t i = 0; i < n; ++i) {
+            if (!(ss >> x[i])) {
+                fprintf(stderr, "bad value %lld in %s\n", (long long)i, line.c_str());
+                return 2;
+            }
+        }
+
+        // one row of n elements: dst = the cache row, src0 = the values, src1 = the row index
+        ggml_init_params params = {
+            /* .mem_size = */ ggml_tensor_overhead()*8 + ggml_graph_overhead(),
+            /* .mem_base = */ NULL,
+            /* .no_alloc = */ true,
+        };
+        ggml_context * ctx = ggml_init(params);
+        ggml_tensor * dst_t = ggml_new_tensor_2d(ctx, t->type, n, 1);
+        ggml_tensor * src0  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, 1);
+        ggml_tensor * src1  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        ggml_tensor * set   = ggml_set_rows(ctx, dst_t, src0, src1);
+        ggml_tensor * got   = ggml_get_rows(ctx, set, src1);
+        ggml_cgraph * gf    = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf, got);
+
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        if (buf == NULL) {
+            fprintf(stderr, "cannot allocate %s tensors\n", backend_name);
+            return 2;
+        }
+        const int32_t idx = 0;
+        ggml_backend_tensor_set(src0, x.data(), 0, n*sizeof(float));
+        ggml_backend_tensor_set(src1, &idx, 0, sizeof(idx));
+        ggml_backend_graph_compute(backend, gf);
+
+        std::vector<uint8_t> q(ggml_row_size(t->type, n));
+        std::vector<float>   y(n);
+        ggml_backend_tensor_get(dst_t, q.data(), 0, q.size());
+        ggml_backend_tensor_get(got,   y.data(), 0, n*sizeof(float));
+
+        std::vector<uint8_t> scales;
+        std::vector<uint8_t> packed;
+        for (int64_t ib = 0; ib < n/t->block; ++ib) {
+            const uint8_t * b = q.data() + ib*t->bs;
+            scales.push_back(b[0]);
+            packed.insert(packed.end(), b + 1, b + t->bs);
+        }
+        out << name << ' ' << n << ' ' << to_hex(scales.data(), scales.size()) << ' '
+            << to_hex(packed.data(), packed.size());
+        for (int64_t i = 0; i < n; ++i) {
+            char buf[16];
+            snprintf(buf, sizeof(buf), " %08x", f2b(y[i]));
+            out << buf;
+        }
+        out << '\n';
+        ++ncase;
+
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+    }
+    printf("emitted %d cases to %s (backend %s)\n", ncase, out_path, ggml_backend_name(backend));
+    ggml_backend_free(backend);
+    return 0;
+}
+
 int main(int argc, char ** argv) {
     if (argc == 1) {
         return self_test();
@@ -385,6 +515,9 @@ int main(int argc, char ** argv) {
     if (argc == 3) {
         return emit(argv[1], argv[2]);
     }
-    fprintf(stderr, "usage: %s [CORPUS OUT]\n", argv[0]);
+    if (argc == 5 && strcmp(argv[3], "--backend") == 0) {
+        return emit_backend(argv[1], argv[2], argv[4]);
+    }
+    fprintf(stderr, "usage: %s [CORPUS OUT [--backend NAME]]\n", argv[0]);
     return 2;
 }
