@@ -1909,6 +1909,25 @@ bool llama_prepare_dsv4_graph_inputs(llama_context & lctx, const llama_batch & b
     set_comp(lctx.dsv4.inputs.csa, lctx.dsv4.csa_plan, true);
     set_comp(lctx.dsv4.inputs.hca, lctx.dsv4.hca_plan, true);
     set_comp(lctx.dsv4.inputs.lid, lctx.dsv4.lid_plan, false);
+
+    if (lctx.dsv4.inputs.lid.k_read_idxs != nullptr) {
+        // Phase 4 (Track C): the read index of a packed (storage-only) lid cache.
+        // The cache rows are per stream (lid_kv_size each); a packed read dequantises
+        // through ggml_get_rows (build_deepseek4.cpp:dsv4_dequant_packed_k), so the
+        // index lists the visible rows of the graph's streams, row-major over
+        // [n_kv, n_stream]: the first n_lid*n_stream entries serve every layer,
+        // because a layer's group block count n_lid never exceeds the plan's n_kv.
+        const auto & lid = lctx.dsv4.lid_ctx;
+        const int64_t n_stream = std::max<int64_t>(1, (int64_t) lid.sinfo.n_stream());
+        std::vector<int32_t> idxs;
+        idxs.reserve((size_t) lid.n_kv * (size_t) n_stream);
+        for (int64_t p = 0; p < lid.n_kv; ++p) {
+            for (int64_t s = 0; s < n_stream; ++s) {
+                idxs.push_back((int32_t) ((int64_t) (lid.sinfo.s0 + s)*(int64_t) lid_kv_size + p));
+            }
+        }
+        dsv4_set_input_tensor(lctx.dsv4.inputs.lid.k_read_idxs, idxs);
+    }
     llama_dsv4_spec_ckpt_record_plan(&lctx);
 
     //tim2 = ggml_time_us();

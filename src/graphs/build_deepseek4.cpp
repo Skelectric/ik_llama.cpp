@@ -99,6 +99,19 @@ static ggml_tensor * dsv4_new_mask_input(ggml_context * ctx, ggml_tensor ** dst,
     return *dst;
 }
 
+// Phase 4 (Track C): a packed (storage-only) lid (indexer-K) cache dequantises on
+// read through ggml_get_rows (see dsv4_dequant_packed_k), so the graph needs the
+// host-filled per-stream read index. Created only when the lid cache is a packed
+// type; the values are set in llama_prepare_dsv4_graph_inputs.
+static void dsv4_new_lid_k_read_idxs_input(ggml_context * ctx, llama_context & lctx) {
+    if (!llama_is_packed_kv_cache_type(lctx.cparams.idx_type_k)) {
+        return;
+    }
+    dsv4_new_i32_input(ctx, &lctx.dsv4.inputs.lid.k_read_idxs,
+            (int64_t) lctx.dsv4.lid_ctx.n_kv * std::max<int64_t>(1, (int64_t) lctx.dsv4.lid_ctx.sinfo.n_stream()),
+            "dsv4_lid_k_read_idxs");
+}
+
 static void dsv4_build_plan_inputs(
         ggml_context * ctx,
         llama_context::dsv4_runtime::comp_inputs & inputs,
@@ -486,6 +499,40 @@ static ggml_tensor * dsv4_comp_get_k(
     }
 
     return dsv4_cache_stream_view_4d(ctx, cache, n_embd_head, n_kv, kv_size, comp.sinfo.s0, (int64_t) comp.sinfo.n_stream());
+}
+
+// Phase 4 (Track C): a packed cache read must not become a compute operand.
+//
+// The packed KV-cache storage types (llama_is_packed_kv_cache_type) are
+// storage-only: their type traits carry to_float/from_float but no vec_dot, so a
+// packed row cannot be src0 of the indexer score matmul and cannot be consumed by
+// the fused indexer top-k. Dequantise the read to F32 through ggml_get_rows - the
+// route the raw cache already takes (dsv4_raw_get_k) - and return the same
+// [n_embd, 1, n_kv, n_stream] shape the view-only read produces.
+//
+// The read index is host-filled (llama_prepare_dsv4_graph_inputs): one entry per
+// visible row, (s0 + s)*kv_size + row, row-major over [n_kv, n_stream], so the
+// first n_kv*n_stream entries address exactly the visible rows of every stream.
+static ggml_tensor * dsv4_dequant_packed_k(
+        ggml_context * ctx,
+        ggml_tensor  * cache,
+        ggml_tensor  * k_read_idxs,
+        int64_t        n_embd_head,
+        int64_t        n_kv,
+        int64_t        n_stream,
+        const llm_build_cb & cb,
+        int            il) {
+    GGML_ASSERT(cache != nullptr);
+    GGML_ASSERT(k_read_idxs != nullptr && "DSV4: a packed K cache read needs its read index");
+    GGML_ASSERT(n_kv > 0 && n_stream > 0);
+    GGML_ASSERT(k_read_idxs->ne[0] >= n_kv*n_stream);
+
+    ggml_tensor * idxs = k_read_idxs->ne[0] == n_kv*n_stream
+            ? k_read_idxs : ggml_view_1d(ctx, k_read_idxs, n_kv*n_stream, 0);
+    ggml_tensor * rows = ggml_get_rows(ctx, dsv4_cache_view_2d(ctx, cache, n_embd_head, cache->ne[1]), idxs);
+    cb(rows, "lid_k_f32", il);
+
+    return ggml_reshape_4d(ctx, rows, n_embd_head, 1, n_kv, n_stream);
 }
 
 static ggml_tensor * dsv4_comp_cpy_k(
@@ -1009,22 +1056,35 @@ static ggml_tensor * dsv4_build_lid_top_k(
     const int32_t lid_src_il = llm.model.arch == LLM_ARCH_DEEPSEEK41
             ? llm.hparams.dsv4_kv_src_layer[il] : il;
     GGML_ASSERT(lid_src_il >= 0 && "DSV4: layer reads index keys with no source");
-    ggml_tensor * indexer_k = dsv4_comp_get_k(ctx0,
-            llm.lctx.dsv4.cache.lid_k[lid_src_il],
-            llm.lctx.dsv4.lid_ctx,
-            n_embd_indexer_head,
-            llm.lctx.dsv4.cache.lid_k[lid_src_il]->ne[1]/std::max<uint32_t>(1, llm.lctx.dsv4.cache.n_stream));
-    GGML_ASSERT(indexer_k != nullptr);
-    GGML_ASSERT(n_lid <= indexer_k->ne[2] && "DSV4: group block count exceeds the lid cache read");
-    if (n_lid < indexer_k->ne[2]) {
-        // View the lid-cache read down to the group's block count (the reference
-        // does the same): the encoder's ratio-2 keys occupy only the first
-        // csa_plan.n_kv rows of the ratio-1-sized shared lid cache.
-        indexer_k = ggml_view_4d(ctx0, indexer_k,
-                indexer_k->ne[0], indexer_k->ne[1], n_lid, indexer_k->ne[3],
-                indexer_k->nb[1], indexer_k->nb[2], indexer_k->nb[3], 0);
+    ggml_tensor * lid_cache = llm.lctx.dsv4.cache.lid_k[lid_src_il];
+    ggml_tensor * indexer_k = nullptr;
+    if (llama_is_packed_kv_cache_type(lid_cache->type)) {
+        // Track C: a packed lid cache is storage-only, so the read dequantises to
+        // F32 (ggml_get_rows) instead of exposing a packed view. The read index
+        // already covers the visible rows, so no separate n_lid view is needed.
+        indexer_k = dsv4_dequant_packed_k(ctx0, lid_cache,
+                llm.lctx.dsv4.inputs.lid.k_read_idxs,
+                n_embd_indexer_head, n_lid,
+                std::max<int64_t>(1, (int64_t) llm.lctx.dsv4.lid_ctx.sinfo.n_stream()),
+                llm.cb, il);
+    } else {
+        indexer_k = dsv4_comp_get_k(ctx0,
+                lid_cache,
+                llm.lctx.dsv4.lid_ctx,
+                n_embd_indexer_head,
+                lid_cache->ne[1]/std::max<uint32_t>(1, llm.lctx.dsv4.cache.n_stream));
+        GGML_ASSERT(indexer_k != nullptr);
+        GGML_ASSERT(n_lid <= indexer_k->ne[2] && "DSV4: group block count exceeds the lid cache read");
+        if (n_lid < indexer_k->ne[2]) {
+            // View the lid-cache read down to the group's block count (the reference
+            // does the same): the encoder's ratio-2 keys occupy only the first
+            // csa_plan.n_kv rows of the ratio-1-sized shared lid cache.
+            indexer_k = ggml_view_4d(ctx0, indexer_k,
+                    indexer_k->ne[0], indexer_k->ne[1], n_lid, indexer_k->ne[3],
+                    indexer_k->nb[1], indexer_k->nb[2], indexer_k->nb[3], 0);
+        }
+        llm.cb(indexer_k, "lid_k", il);
     }
-    llm.cb(indexer_k, "lid_k", il);
 
     const int64_t n_stream = std::max<int64_t>(1, indexer_k->ne[3]);
     indexer_q = ggml_view_4d(ctx0, indexer_q,
@@ -1651,6 +1711,7 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
     dsv4_build_plan_inputs(ctx0, lctx.dsv4.inputs.csa, lctx.dsv4.csa_plan, "dsv4_csa", n_tokens, true, lctx.cparams.flash_attn);
     dsv4_build_plan_inputs(ctx0, lctx.dsv4.inputs.hca, lctx.dsv4.hca_plan, "dsv4_hca", n_tokens, true, lctx.cparams.flash_attn);
     dsv4_build_plan_inputs(ctx0, lctx.dsv4.inputs.lid, lctx.dsv4.lid_plan, "dsv4_lid", n_tokens, false, lctx.cparams.flash_attn);
+    dsv4_new_lid_k_read_idxs_input(ctx0, lctx);
 
     ggml_tensor * inp_pos = build_inp_pos();
     // build only the mask the graph consumes; an input tensor without a consumer is never allocated
@@ -1971,6 +2032,7 @@ ggml_cgraph * llm_build_context::build_deepseek41() {
     dsv4_build_plan_inputs(ctx0, lctx.dsv4.inputs.hca, lctx.dsv4.hca_plan, "dsv4_hca", n_tokens, true, lctx.cparams.flash_attn,
             hparams.dsv4_candidate_block_size, hparams.dsv4_candidate_topk_blocks);
     dsv4_build_plan_inputs(ctx0, lctx.dsv4.inputs.lid, lctx.dsv4.lid_plan, "dsv4_lid", n_tokens, false, lctx.cparams.flash_attn);
+    dsv4_new_lid_k_read_idxs_input(ctx0, lctx);
 
     ggml_tensor * inp_pos = build_inp_pos();
 

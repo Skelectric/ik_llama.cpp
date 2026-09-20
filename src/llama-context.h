@@ -593,6 +593,12 @@ struct llama_context {
             struct ggml_tensor * state_write_idxs_lid = nullptr;
             struct ggml_tensor * state_write_pos = nullptr;
             struct ggml_tensor * kq_mask = nullptr;
+            // Phase 4 (Track C): read index into a packed (storage-only) K cache,
+            // I32 [n_kv*n_stream], row-major over [n_kv, n_stream], entry
+            // (s0 + s)*kv_size + row. Host-filled; only created when the group's
+            // cache is a packed type, because such a read dequantises through
+            // ggml_get_rows and needs the row index (llama_is_packed_kv_cache_type).
+            struct ggml_tensor * k_read_idxs = nullptr;
             // V4.1 hierarchical indexer: F32 [n_kv/cand_block, n_tokens/n_stream, 1, n_stream],
             // +inf on the block holding each query's newest visible compressed position,
                        // 0 elsewhere. Only allocated when the candidate selection can bite
