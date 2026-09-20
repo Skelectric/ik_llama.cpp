@@ -599,6 +599,14 @@ struct llama_context {
             // cache is a packed type, because such a read dequantises through
             // ggml_get_rows and needs the row index (llama_is_packed_kv_cache_type).
             struct ggml_tensor * k_read_idxs = nullptr;
+            // Phase 4 (Track D.1): identity row index for the indexer-Q fp4
+            // round-trip (set_rows into a packed scratch, get_rows back to F32).
+            // I32 [indexer_n_head * n_ubatch], host-filled, the first
+            // indexer_n_head*n_tokens entries are the identity. Only created when
+            // the indexer K cache is a packed type (llama_is_packed_kv_cache_type);
+            // an in-graph ggml_arange would need an F32->I32 cast kernel, which the
+            // CPU backend does not have.
+            struct ggml_tensor * q_round_idxs = nullptr;
             // V4.1 hierarchical indexer: F32 [n_kv/cand_block, n_tokens/n_stream, 1, n_stream],
             // +inf on the block holding each query's newest visible compressed position,
                        // 0 elsewhere. Only allocated when the candidate selection can bite

@@ -112,6 +112,19 @@ static void dsv4_new_lid_k_read_idxs_input(ggml_context * ctx, llama_context & l
             "dsv4_lid_k_read_idxs");
 }
 
+// Phase 4 (Track D.1): the identity row index of the indexer-Q round-trip. The Q
+// rows are (head, token) pairs, so the identity over the first n_head*n_tokens
+// entries serves every indexer layer of the graph. Host-filled in
+// llama_prepare_dsv4_graph_inputs; created only when the indexer K cache is packed.
+static void dsv4_new_lid_q_round_idxs_input(ggml_context * ctx, llama_context & lctx) {
+    if (!llama_is_packed_kv_cache_type(lctx.cparams.idx_type_k)) {
+        return;
+    }
+    dsv4_new_i32_input(ctx, &lctx.dsv4.inputs.lid.q_round_idxs,
+            (int64_t) lctx.model.hparams.indexer_n_head * (int64_t) lctx.cparams.n_ubatch,
+            "dsv4_lid_q_round_idxs");
+}
+
 static void dsv4_build_plan_inputs(
         ggml_context * ctx,
         llama_context::dsv4_runtime::comp_inputs & inputs,
@@ -995,6 +1008,51 @@ static ggml_tensor * dsv4_build_candidate_mask(
     return keep;
 }
 
+// Track D.1: round the indexer Q onto the fp4 grid and straight back - the
+// reference's `fp4_act_quant(q, fp4_block_size, True)` (reference/model.py:552),
+// which writes the dequantised values back into Q. It must sit post-rope and
+// upstream of BOTH score paths, and it is not optional: D.0 measured on the real
+// V4.1 that the round-trip changes the top-k selection for 100% of the tokens and
+// 7.33% of the slots, so scoring a packed indexer K against an unrounded Q is a
+// silent deviation on essentially every selection (todo D.0, plan section 7.9).
+//
+// The fake-quant needs no new op and no new type (plan section 3.3):
+// `ggml_set_rows` into a scratch of the indexer-K type (whose `from_float` IS the
+// reference rule: block 32, E8M0 scale, floor 6*2**-126), then `ggml_get_rows`
+// back to F32. Q is never cached, so the footprint is unchanged - this is a
+// rounding-only site.
+//
+// The row index is the host-filled identity `dsv4_lid_q_round_idxs`, the same
+// pattern `dsv4_lid_k_read_idxs` uses: an in-graph `ggml_arange` plus a cast would
+// need an F32->I32 cast kernel, which the CPU backend does not have (verified:
+// `ggml.c:12638: fatal error` in `ggml_compute_forward_dup_f32`).
+static ggml_tensor * dsv4_round_indexer_q(
+        ggml_context * ctx,
+        ggml_tensor  * indexer_q,
+        ggml_tensor  * idxs,
+        ggml_type      type,
+        const llm_build_cb & cb,
+        int            il) {
+    GGML_ASSERT(indexer_q->type == GGML_TYPE_F32);
+    GGML_ASSERT(llama_is_packed_kv_cache_type(type));
+    GGML_ASSERT(indexer_q->ne[0] % ggml_blck_size(type) == 0);
+
+    const int64_t n_embd = indexer_q->ne[0];
+    const int64_t n_rows = indexer_q->ne[1]*indexer_q->ne[2];
+    GGML_ASSERT(idxs != nullptr && idxs->type == GGML_TYPE_I32 && idxs->ne[0] >= n_rows);
+
+    ggml_tensor * q_2d    = ggml_view_2d(ctx, indexer_q, n_embd, n_rows, indexer_q->nb[1], 0);
+    ggml_tensor * scratch = ggml_new_tensor_2d(ctx, type, n_embd, n_rows);
+    ggml_tensor * rows    = idxs->ne[0] == n_rows ? idxs : ggml_view_1d(ctx, idxs, n_rows, 0);
+
+    ggml_tensor * write = ggml_set_rows(ctx, scratch, dsv4_require_f32_rows(ctx, q_2d), rows);
+    cb(write, "indexer_q_fp4", il);
+    ggml_tensor * back = ggml_get_rows(ctx, write, rows);
+    cb(back, "indexer_q_round", il);
+
+    return ggml_reshape_3d(ctx, back, n_embd, indexer_q->ne[1], indexer_q->ne[2]);
+}
+
 static ggml_tensor * dsv4_build_lid_top_k(
         ggml_context * ctx0,
         llm_build_context & llm,
@@ -1038,6 +1096,24 @@ static ggml_tensor * dsv4_build_lid_top_k(
             llm.ext_factor, dsv4_rope_attn_factor(llm.freq_scale, llm.ext_factor), llm.beta_fast, llm.beta_slow);
     indexer_q->op_params[15] = 1;
     llm.cb(indexer_q, "indexer_q", il);
+
+    // Track D.1: round the indexer Q onto the packed indexer-K grid before it is
+    // used as a score operand (see dsv4_round_indexer_q). Gated on the indexer K
+    // cache actually being packed, so the feature-off (and f16 lid cache) path is
+    // bit-unchanged (plan section 7.7). The lid cache is resolved here, earlier
+    // than the read below, because the rounding needs its type.
+    //
+    // V4.1 cross-layer sharing: the index keys are read from the layer's
+    // kv_src_layer (the group's Full/Reindex layer), not from itself.
+    const int32_t lid_src_il = llm.model.arch == LLM_ARCH_DEEPSEEK41
+            ? llm.hparams.dsv4_kv_src_layer[il] : il;
+    GGML_ASSERT(lid_src_il >= 0 && "DSV4: layer reads index keys with no source");
+    ggml_tensor * lid_cache = llm.lctx.dsv4.cache.lid_k[lid_src_il];
+    if (llama_is_packed_kv_cache_type(lid_cache->type)) {
+        indexer_q = dsv4_round_indexer_q(ctx0, indexer_q,
+                llm.lctx.dsv4.inputs.lid.q_round_idxs, lid_cache->type, llm.cb, il);
+    }
+
     // V4.1 has no shared k_rot rotation (the 128-dim indexer cannot be rotated), so
     // the indexer_q hadamard is V4-only. V4.1 relies on the indexer_k / indexer_q
     // projection alignment without the shared hadamard transform.
@@ -1051,12 +1127,6 @@ static ggml_tensor * dsv4_build_lid_top_k(
     llm.cb(indexer_weights, "lid_weights", il);
     indexer_weights = ggml_scale(ctx0, indexer_weights, 1.0f / std::sqrt(float(n_embd_indexer_head * n_indexer_head)));
 
-    // V4.1 cross-layer sharing: the index keys are read from the layer's
-    // kv_src_layer (the group's Full/Reindex layer), not from itself.
-    const int32_t lid_src_il = llm.model.arch == LLM_ARCH_DEEPSEEK41
-            ? llm.hparams.dsv4_kv_src_layer[il] : il;
-    GGML_ASSERT(lid_src_il >= 0 && "DSV4: layer reads index keys with no source");
-    ggml_tensor * lid_cache = llm.lctx.dsv4.cache.lid_k[lid_src_il];
     ggml_tensor * indexer_k = nullptr;
     if (llama_is_packed_kv_cache_type(lid_cache->type)) {
         // Track C: a packed lid cache is storage-only, so the read dequantises to
@@ -1712,6 +1782,7 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
     dsv4_build_plan_inputs(ctx0, lctx.dsv4.inputs.hca, lctx.dsv4.hca_plan, "dsv4_hca", n_tokens, true, lctx.cparams.flash_attn);
     dsv4_build_plan_inputs(ctx0, lctx.dsv4.inputs.lid, lctx.dsv4.lid_plan, "dsv4_lid", n_tokens, false, lctx.cparams.flash_attn);
     dsv4_new_lid_k_read_idxs_input(ctx0, lctx);
+    dsv4_new_lid_q_round_idxs_input(ctx0, lctx);
 
     ggml_tensor * inp_pos = build_inp_pos();
     // build only the mask the graph consumes; an input tensor without a consumer is never allocated
@@ -2033,6 +2104,7 @@ ggml_cgraph * llm_build_context::build_deepseek41() {
             hparams.dsv4_candidate_block_size, hparams.dsv4_candidate_topk_blocks);
     dsv4_build_plan_inputs(ctx0, lctx.dsv4.inputs.lid, lctx.dsv4.lid_plan, "dsv4_lid", n_tokens, false, lctx.cparams.flash_attn);
     dsv4_new_lid_k_read_idxs_input(ctx0, lctx);
+    dsv4_new_lid_q_round_idxs_input(ctx0, lctx);
 
     ggml_tensor * inp_pos = build_inp_pos();
 

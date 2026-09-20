@@ -1928,6 +1928,20 @@ bool llama_prepare_dsv4_graph_inputs(llama_context & lctx, const llama_batch & b
         }
         dsv4_set_input_tensor(lctx.dsv4.inputs.lid.k_read_idxs, idxs);
     }
+
+    if (lctx.dsv4.inputs.lid.q_round_idxs != nullptr) {
+        // Phase 4 (Track D.1): the identity row index of the indexer-Q round-trip
+        // (build_deepseek4.cpp:dsv4_round_indexer_q). The Q rows are (head, token)
+        // pairs, so the first n_head*n_tokens entries are the identity and serve
+        // every indexer layer of this graph.
+        const int64_t n_rows = (int64_t) lctx.model.hparams.indexer_n_head * (int64_t) batch.n_tokens;
+        GGML_ASSERT(n_rows <= lctx.dsv4.inputs.lid.q_round_idxs->ne[0]);
+        std::vector<int32_t> idxs((size_t) n_rows);
+        for (int64_t i = 0; i < n_rows; ++i) {
+            idxs[(size_t) i] = (int32_t) i;
+        }
+        dsv4_set_input_tensor(lctx.dsv4.inputs.lid.q_round_idxs, idxs);
+    }
     llama_dsv4_spec_ckpt_record_plan(&lctx);
 
     //tim2 = ggml_time_us();
