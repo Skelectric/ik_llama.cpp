@@ -971,7 +971,15 @@ bool llama_context::ensure_dsv4_cache_tensors() {
     // decoder index keys (different block counts) fit in the shared lid cache.
     const uint32_t lid_kv = GGML_PAD(dsv4_comp_size(cparams.n_ctx, lid_ratio), 256u);
 
+    // Phase 4 (Track E): the compressed (main) K cache is the packed fp4 type when
+    // the feature is on - the plan's shipped main KV (fp4 E2M1, block 16, E4M3
+    // scale amax/6.0, section 1.1). It is selected independently of the raw /
+    // sliding-window cache, whose type comes from -ctk (the fp8 window is Track F),
+    // because the reference stores the window and the main KV in different types.
+    const ggml_type comp_type_k = cparams.packed_kv_cache ? GGML_TYPE_FP4_B16_E4M3 : kv_self.type_k;
+
     if (!dsv4_validate_cache_type(kv_self.type_k, n_embd_head, "raw/CSA/HCA", DSV4_CACHE_SITE_MAIN, cparams.packed_kv_cache) ||
+        !dsv4_validate_cache_type(comp_type_k, n_embd_head, "CSA/HCA", DSV4_CACHE_SITE_MAIN, cparams.packed_kv_cache) ||
         !dsv4_validate_cache_type(cparams.idx_type_k, n_indexer_head, "LID", DSV4_CACHE_SITE_INDEXER, cparams.packed_kv_cache)) {
         return false;
     }
@@ -1026,7 +1034,7 @@ bool llama_context::ensure_dsv4_cache_tensors() {
         ggml_backend_buffer_type_t buft = llama_dsv4_layer_buft(*this, il);
 
         if (ratio == csa_ratio) {
-            cache.csa_k[(size_t) il] = ggml_new_tensor_3d(cache.cache_ctx, kv_self.type_k, n_embd_head, csa_kv*n_stream, 1);
+            cache.csa_k[(size_t) il] = ggml_new_tensor_3d(cache.cache_ctx, comp_type_k, n_embd_head, csa_kv*n_stream, 1);
             cache.lid_k[(size_t) il] = ggml_new_tensor_3d(cache.cache_ctx, cparams.idx_type_k, n_indexer_head, lid_kv*n_stream, 1);
             cache.csa_state_kv[(size_t) il] = ggml_new_tensor_2d(cache.cache_ctx, GGML_TYPE_F32, csa_state_width*n_embd_head, csa_state_width*csa_ratio*n_stream);
             cache.csa_state_score[(size_t) il] = ggml_new_tensor_2d(cache.cache_ctx, GGML_TYPE_F32, csa_state_width*n_embd_head, csa_state_width*csa_ratio*n_stream);
@@ -1044,7 +1052,7 @@ bool llama_context::ensure_dsv4_cache_tensors() {
                 return false;
             }
         } else if (ratio == hca_ratio) {
-            cache.hca_k[(size_t) il] = ggml_new_tensor_3d(cache.cache_ctx, kv_self.type_k, n_embd_head, hca_kv*n_stream, 1);
+            cache.hca_k[(size_t) il] = ggml_new_tensor_3d(cache.cache_ctx, comp_type_k, n_embd_head, hca_kv*n_stream, 1);
             cache.hca_state_kv[(size_t) il] = ggml_new_tensor_2d(cache.cache_ctx, GGML_TYPE_F32, n_embd_head, hca_ratio*n_stream);
             cache.hca_state_score[(size_t) il] = ggml_new_tensor_2d(cache.cache_ctx, GGML_TYPE_F32, n_embd_head, hca_ratio*n_stream);
 
@@ -1101,8 +1109,8 @@ bool llama_context::ensure_dsv4_cache_tensors() {
 
     LLAMA_LOG_INFO("%s: DSV4 cache: CSA K=%7.2f MiB (%s), HCA K=%7.2f MiB (%s), LID K=%7.2f MiB (%s), states=%7.2f MiB, total=%7.2f MiB, streams=%u\n",
             __func__,
-            (float) csa_k_bytes / (1024.0f * 1024.0f), ggml_type_name(kv_self.type_k),
-            (float) hca_k_bytes / (1024.0f * 1024.0f), ggml_type_name(kv_self.type_k),
+            (float) csa_k_bytes / (1024.0f * 1024.0f), ggml_type_name(comp_type_k),
+            (float) hca_k_bytes / (1024.0f * 1024.0f), ggml_type_name(comp_type_k),
             (float) lid_k_bytes / (1024.0f * 1024.0f), ggml_type_name(cparams.idx_type_k),
             (float) (csa_state_bytes + hca_state_bytes + lid_state_bytes) / (1024.0f * 1024.0f),
             (float) (csa_k_bytes + hca_k_bytes + lid_k_bytes + csa_state_bytes + hca_state_bytes + lid_state_bytes) / (1024.0f * 1024.0f),
@@ -1928,6 +1936,28 @@ bool llama_prepare_dsv4_graph_inputs(llama_context & lctx, const llama_batch & b
         }
         dsv4_set_input_tensor(lctx.dsv4.inputs.lid.k_read_idxs, idxs);
     }
+
+    // Phase 4 (Track E): the read index of a packed (storage-only) compressed
+    // (main) K cache. Same construction as the lid index above, with each group's
+    // own stream geometry and kv_size; the graph reads it through
+    // dsv4_dequant_packed_k (build_deepseek4.cpp).
+    auto set_comp_k_read_idxs = [&](llama_context::dsv4_runtime::comp_inputs & inputs,
+            const llama_context::dsv4_runtime::comp_context & comp, uint32_t kv_size) {
+        if (inputs.k_read_idxs == nullptr) {
+            return;
+        }
+        const int64_t n_stream = std::max<int64_t>(1, (int64_t) comp.sinfo.n_stream());
+        std::vector<int32_t> idxs;
+        idxs.reserve((size_t) comp.n_kv * (size_t) n_stream);
+        for (int64_t p = 0; p < comp.n_kv; ++p) {
+            for (int64_t s = 0; s < n_stream; ++s) {
+                idxs.push_back((int32_t) ((int64_t) (comp.sinfo.s0 + s)*(int64_t) kv_size + p));
+            }
+        }
+        dsv4_set_input_tensor(inputs.k_read_idxs, idxs);
+    };
+    set_comp_k_read_idxs(lctx.dsv4.inputs.csa, lctx.dsv4.csa_ctx, csa_kv_size);
+    set_comp_k_read_idxs(lctx.dsv4.inputs.hca, lctx.dsv4.hca_ctx, hca_kv_size);
 
     if (lctx.dsv4.inputs.lid.q_round_idxs != nullptr) {
         // Phase 4 (Track D.1): the identity row index of the indexer-Q round-trip

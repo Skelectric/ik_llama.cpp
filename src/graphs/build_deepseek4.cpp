@@ -112,6 +112,27 @@ static void dsv4_new_lid_k_read_idxs_input(ggml_context * ctx, llama_context & l
             "dsv4_lid_k_read_idxs");
 }
 
+// Phase 4 (Track E): the compressed (main) K cache dequantises on read the same
+// way the lid cache does (see dsv4_dequant_packed_k), so the CSA and HCA groups
+// need the same host-filled per-stream read index - their own stream geometry,
+// (s0 + s)*kv_size + row, with the group's kv_size. Created only when the feature
+// flag is on (the compressed cache is then packed); the values are set in
+// llama_prepare_dsv4_graph_inputs.
+static void dsv4_new_comp_k_read_idxs_input(ggml_context * ctx, llama_context & lctx,
+        llama_context::dsv4_runtime::comp_inputs & inputs,
+        const llama_context::dsv4_runtime::comp_context & comp,
+        const char * name) {
+    // The compressed (main) K cache is packed exactly when the feature flag is on
+    // (Track E.2, llama-dsv4.cpp: comp_type_k), independently of the raw/window
+    // cache type - so the gate is the flag, not kv_self.type_k.
+    if (!lctx.cparams.packed_kv_cache) {
+        return;
+    }
+    dsv4_new_i32_input(ctx, &inputs.k_read_idxs,
+            (int64_t) comp.n_kv * std::max<int64_t>(1, (int64_t) comp.sinfo.n_stream()),
+            name);
+}
+
 // Phase 4 (Track D.1): the identity row index of the indexer-Q round-trip. The Q
 // rows are (head, token) pairs, so the identity over the first n_head*n_tokens
 // entries serves every indexer layer of the graph. Host-filled in
@@ -408,7 +429,12 @@ static ggml_tensor * dsv4_raw_get_k(
 
     const int64_t n_head_kv = n_embd_gqa/n_embd_head;
 
-    if (n_stream == 1 && lctx->kv_self.n == raw_k_read_idxs->ne[0]) {
+    if (n_stream == 1 && lctx->kv_self.n == raw_k_read_idxs->ne[0] &&
+            !llama_is_packed_kv_cache_type(cache->type)) {
+        // Phase 4 (Track E): a packed (storage-only) raw cache has no vec_dot, so it
+        // cannot be an FA operand (the CPU FA needs a from_float vec_dot_type; the
+        // packed types carry none, and F32 carries no from_float either). Fall
+        // through to the dequantising gather below, which casts to F16.
         return ggml_view_3d(ctx, cache, n_embd_head, n_head_kv, n_kv,
                 ggml_row_size(cache->type, n_embd_head),
                 ggml_row_size(cache->type, n_embd_head)*n_head_kv, 0);
@@ -423,7 +449,13 @@ static ggml_tensor * dsv4_raw_get_k(
             ? raw_k_read_idxs : ggml_cast(ctx, raw_k_read_idxs, GGML_TYPE_I32);
     ggml_tensor * rows = ggml_get_rows(ctx, cache_2d, idxs);
     cb(rows, "raw_k", il);
-    if (ggml_is_quantized(cache->type) && rows->type != GGML_TYPE_F32) {
+    if (llama_is_packed_kv_cache_type(cache->type)) {
+        // Phase 4 (Track E): the dequantising get_rows returns F32, but the FA
+        // operand must be a compute type - cast to F16, the type the FA path casts
+        // to (plan section 3.2). The packed view above is not an option: it has no
+        // vec_dot and its type is refused by both FA paths.
+        rows = ggml_cast(ctx, rows, GGML_TYPE_F16);
+    } else if (ggml_is_quantized(cache->type) && rows->type != GGML_TYPE_F32) {
         rows = ggml_cast(ctx, rows, GGML_TYPE_F32);
     } else if (rows->type != cache->type && !ggml_is_quantized(cache->type)) {
         rows = ggml_cast(ctx, rows, cache->type);
@@ -526,6 +558,16 @@ static ggml_tensor * dsv4_comp_get_k(
 // The read index is host-filled (llama_prepare_dsv4_graph_inputs): one entry per
 // visible row, (s0 + s)*kv_size + row, row-major over [n_kv, n_stream], so the
 // first n_kv*n_stream entries address exactly the visible rows of every stream.
+//
+// Phase 4 (Track E): the compressed (main) K cache reuses this read for the same
+// reason - it is the shared cache the FA concat consumes, so a packed view must
+// not reach the concat. The cast cannot dequantise it either: ggml_cast is a CPY,
+// and the CPU dup_q aborts for any non-F32 dst (`ggml.c: fatal error`) while the
+// CUDA cpy dispatch has no packed-src kernel (cpy.cu covers Q4_0/Q4_1/Q5_0/Q5_1/
+// Q6_0/IQ4_NL/Q8_0 only, despite `ggml_cuda_supports_op` accepting a quantised
+// src). The CSA/HCA read index is host-filled the same way (its own stream
+// geometry); the already-gathered V4.1 index-source read dequantises in place
+// (`ggml_get_rows_ext(..., same_type=false)` in build_deepseek4).
 static ggml_tensor * dsv4_dequant_packed_k(
         ggml_context * ctx,
         ggml_tensor  * cache,
@@ -534,7 +576,8 @@ static ggml_tensor * dsv4_dequant_packed_k(
         int64_t        n_kv,
         int64_t        n_stream,
         const llm_build_cb & cb,
-        int            il) {
+        int            il,
+        const char   * cb_name) {
     GGML_ASSERT(cache != nullptr);
     GGML_ASSERT(k_read_idxs != nullptr && "DSV4: a packed K cache read needs its read index");
     GGML_ASSERT(n_kv > 0 && n_stream > 0);
@@ -543,7 +586,7 @@ static ggml_tensor * dsv4_dequant_packed_k(
     ggml_tensor * idxs = k_read_idxs->ne[0] == n_kv*n_stream
             ? k_read_idxs : ggml_view_1d(ctx, k_read_idxs, n_kv*n_stream, 0);
     ggml_tensor * rows = ggml_get_rows(ctx, dsv4_cache_view_2d(ctx, cache, n_embd_head, cache->ne[1]), idxs);
-    cb(rows, "lid_k_f32", il);
+    cb(rows, cb_name, il);
 
     return ggml_reshape_4d(ctx, rows, n_embd_head, 1, n_kv, n_stream);
 }
@@ -1136,7 +1179,7 @@ static ggml_tensor * dsv4_build_lid_top_k(
                 llm.lctx.dsv4.inputs.lid.k_read_idxs,
                 n_embd_indexer_head, n_lid,
                 std::max<int64_t>(1, (int64_t) llm.lctx.dsv4.lid_ctx.sinfo.n_stream()),
-                llm.cb, il);
+                llm.cb, il, "lid_k_f32");
     } else {
         indexer_k = dsv4_comp_get_k(ctx0,
                 lid_cache,
@@ -1589,12 +1632,26 @@ static ggml_tensor * ds4_attention(ggml_cgraph * gf, ggml_context * ctx0, llm_bu
     }
 
     auto build_the_attn = [&] (ggml_tensor * raw_k, ggml_tensor * raw_mask, ggml_tensor * extra_mask,
-            ggml_tensor * cache, const auto & extra_ctx,
+            ggml_tensor * cache, const auto & extra_ctx, ggml_tensor * extra_k_read_idxs,
             const std::string & tag, int n_swa_eff) {
         auto n_stream = std::max<uint32_t>(1, lctx.dsv4.cache.n_stream);
         auto extra_k = cache;
         if (extra_k->ne[1] > 1) {
-            extra_k = dsv4_comp_get_k(ctx0, cache, extra_ctx, n_embd_head, cache->ne[1]/n_stream);
+            if (llama_is_packed_kv_cache_type(extra_k->type)) {
+                // Phase 4 (Track E): a packed compressed (main) K cache is
+                // storage-only, so the read dequantises to F32 through ggml_get_rows
+                // (dsv4_dequant_packed_k), the way the packed lid cache and the
+                // quantised raw cache already do. The packed view must not reach the
+                // concat: ggml_cast cannot dequantise it (the CPU dup_q aborts for a
+                // non-F32 dst; the CUDA cpy dispatch has no packed-src kernel), and a
+                // packed operand must never reach FA (G7).
+                extra_k = dsv4_dequant_packed_k(ctx0, cache, extra_k_read_idxs,
+                        n_embd_head, extra_ctx.n_kv,
+                        std::max<int64_t>(1, (int64_t) extra_ctx.sinfo.n_stream()),
+                        cb, il, (tag + "_k_f32").c_str());
+            } else {
+                extra_k = dsv4_comp_get_k(ctx0, cache, extra_ctx, n_embd_head, cache->ne[1]/n_stream);
+            }
             cb(extra_k, "extra_k", il);
         }
         if (cparams.flash_attn) {
@@ -1662,7 +1719,11 @@ static ggml_tensor * ds4_attention(ggml_cgraph * gf, ggml_context * ctx0, llm_bu
                 // When we are dealing with a single token, we can just use ggml_get_rows_ext to get the
                 // selected rows from the CSA cache and setup the corresponding mask. This makes the
                 // raw_kv and csa_kv concetenation much less expensive for long context.
-                csa_kv = ggml_get_rows_ext(ctx0, csa_kv, top_k, true, false);
+                // Phase 4 (Track E): a packed csa cache dequantises in the gather
+                // (same_type=false -> ggml_get_rows); the gathered rows are consumed
+                // directly as the attention K, so a packed result would reach the
+                // concat cast and abort in the CPU dup_q.
+                csa_kv = ggml_get_rows_ext(ctx0, csa_kv, top_k, !llama_is_packed_kv_cache_type(csa_kv->type), false);
                 csa_kv = ggml_reshape_3d(ctx0, csa_kv, csa_kv->ne[0], 1, csa_kv->ne[1]);
                 cb(csa_kv, "csa_kv_getrows", il);
                 csa_mask = ggml_get_rows_ext(ctx0, csa_mask, top_k, true, true);
@@ -1673,7 +1734,7 @@ static ggml_tensor * ds4_attention(ggml_cgraph * gf, ggml_context * ctx0, llm_bu
             }
         }
         int n_csa = hparams.n_swa + hparams.indexer_top_k;
-        attn = build_the_attn(raw_k, raw_mask, csa_mask, csa_kv, lctx.dsv4.csa_ctx, "csa", n_csa);
+        attn = build_the_attn(raw_k, raw_mask, csa_mask, csa_kv, lctx.dsv4.csa_ctx, lctx.dsv4.inputs.csa.k_read_idxs, "csa", n_csa);
         cb(attn, "attn_csa", il);
     } else if (ratio == hparams.dsv4_hca_ratio &&
             lctx.dsv4.inputs.hca.kq_mask != nullptr &&
@@ -1701,7 +1762,12 @@ static ggml_tensor * ds4_attention(ggml_cgraph * gf, ggml_context * ctx0, llm_bu
                     if (topk_carry) { *topk_carry = top_k; }
                 }
                 if (n_tokens == 1) {
-                    hca_kv = ggml_get_rows_ext(ctx0, hca_kv, top_k, true, false);
+                    // Phase 4 (Track E): a packed hca cache dequantises in the gather
+                    // (same_type=false -> ggml_get_rows), because the gathered rows
+                    // are consumed directly as the attention K. The gather's row
+                    // numbering is its own (a contiguous selection), so it needs no
+                    // host read index - unlike the raw-cache view read above.
+                    hca_kv = ggml_get_rows_ext(ctx0, hca_kv, top_k, !llama_is_packed_kv_cache_type(hca_kv->type), false);
                     hca_kv = ggml_reshape_3d(ctx0, hca_kv, hca_kv->ne[0], 1, hca_kv->ne[1]);
                     cb(hca_kv, "hca_kv_getrows", il);
                     hca_mask = ggml_get_rows_ext(ctx0, hca_mask, top_k, true, true);
@@ -1712,10 +1778,10 @@ static ggml_tensor * ds4_attention(ggml_cgraph * gf, ggml_context * ctx0, llm_bu
                 }
             }
             int n_hca = hparams.n_swa + hparams.indexer_top_k;
-            attn = build_the_attn(raw_k, raw_mask, hca_mask, hca_kv, lctx.dsv4.hca_ctx, "hca", n_hca);
+            attn = build_the_attn(raw_k, raw_mask, hca_mask, hca_kv, lctx.dsv4.hca_ctx, lctx.dsv4.inputs.hca.k_read_idxs, "hca", n_hca);
         } else {
             int n_hca = hparams.n_swa + (n_kv + hparams.dsv4_hca_ratio - 1)/hparams.dsv4_hca_ratio;
-            attn = build_the_attn(raw_k, raw_mask, hca_mask, hca_kv, lctx.dsv4.hca_ctx, "hca", n_hca);
+            attn = build_the_attn(raw_k, raw_mask, hca_mask, hca_kv, lctx.dsv4.hca_ctx, lctx.dsv4.inputs.hca.k_read_idxs, "hca", n_hca);
         }
         cb(attn, "attn_hca", il);
     } else {
@@ -1782,6 +1848,8 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
     dsv4_build_plan_inputs(ctx0, lctx.dsv4.inputs.hca, lctx.dsv4.hca_plan, "dsv4_hca", n_tokens, true, lctx.cparams.flash_attn);
     dsv4_build_plan_inputs(ctx0, lctx.dsv4.inputs.lid, lctx.dsv4.lid_plan, "dsv4_lid", n_tokens, false, lctx.cparams.flash_attn);
     dsv4_new_lid_k_read_idxs_input(ctx0, lctx);
+    dsv4_new_comp_k_read_idxs_input(ctx0, lctx, lctx.dsv4.inputs.csa, lctx.dsv4.csa_ctx, "dsv4_csa_k_read_idxs");
+    dsv4_new_comp_k_read_idxs_input(ctx0, lctx, lctx.dsv4.inputs.hca, lctx.dsv4.hca_ctx, "dsv4_hca_k_read_idxs");
     dsv4_new_lid_q_round_idxs_input(ctx0, lctx);
 
     ggml_tensor * inp_pos = build_inp_pos();
@@ -2104,6 +2172,8 @@ ggml_cgraph * llm_build_context::build_deepseek41() {
             hparams.dsv4_candidate_block_size, hparams.dsv4_candidate_topk_blocks);
     dsv4_build_plan_inputs(ctx0, lctx.dsv4.inputs.lid, lctx.dsv4.lid_plan, "dsv4_lid", n_tokens, false, lctx.cparams.flash_attn);
     dsv4_new_lid_k_read_idxs_input(ctx0, lctx);
+    dsv4_new_comp_k_read_idxs_input(ctx0, lctx, lctx.dsv4.inputs.csa, lctx.dsv4.csa_ctx, "dsv4_csa_k_read_idxs");
+    dsv4_new_comp_k_read_idxs_input(ctx0, lctx, lctx.dsv4.inputs.hca, lctx.dsv4.hca_ctx, "dsv4_hca_k_read_idxs");
     dsv4_new_lid_q_round_idxs_input(ctx0, lctx);
 
     ggml_tensor * inp_pos = build_inp_pos();
