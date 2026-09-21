@@ -1029,37 +1029,97 @@ bool llama_context::ensure_dsv4_cache_tensors() {
         return true;
     };
 
+    // Track H (H.2): the compressed-K tensors are allocated on their OWNER layer
+    // only. The write side is gated on the source maps (`is_csa_kv_source` /
+    // `is_hca_kv_source`, build_deepseek4.cpp:1514/:1556, and `layer.indexer_attn_k`
+    // for the V4.1 index keys), and every read resolves through the group's owner
+    // (`dsv4_kv_src_layer[il]`, :1192/:1743/:1791), so a non-owner layer's tensor is
+    // never written and never read - dead memory. On the 748.5B V4.1 file that is 53
+    // of the 61 compressed-K tensors (csa 15/18, hca 19/20, lid 15/23) - ~2.2 GiB at
+    // n_ctx 256000 under the packed layout, ~9 GiB at f16. V4 is unaffected: every
+    // compressing layer is its own owner there (`dsv4_is_kv_source[il] = ratio != 0`).
+    //
+    // The lid (index-key) cache is the one tensor with two owners: it is WRITTEN by
+    // every index source (the V4.1 Reindex layers 24/28/32/36 write their own lid
+    // cache, build_deepseek4.cpp:1536/:1576) and READ through the group's owner
+    // (:1192). So it is allocated for the union. The state tensors stay per-layer:
+    // they are the compressor's running state, walked by the per-step checkpoint
+    // (`dsv4_state_tensors`), and they are ~4 KiB per layer.
+    auto is_kv_owner = [&](int32_t il) {
+        return model.arch != LLM_ARCH_DEEPSEEK41 || model.hparams.dsv4_is_kv_source[(size_t) il];
+    };
+    auto is_index_owner = [&](int32_t il) {
+        return model.arch != LLM_ARCH_DEEPSEEK41 || model.hparams.dsv4_is_index_source[(size_t) il];
+    };
+    uint32_t n_owner_csa = 0;
+    uint32_t n_owner_hca = 0;
+    uint32_t n_owner_lid = 0;
+
     for (int32_t il = 0; il < n_layer; ++il) {
         const uint32_t ratio = model.hparams.dsv4_compress_ratios[(size_t) il];
         ggml_backend_buffer_type_t buft = llama_dsv4_layer_buft(*this, il);
 
         if (ratio == csa_ratio) {
-            cache.csa_k[(size_t) il] = ggml_new_tensor_3d(cache.cache_ctx, comp_type_k, n_embd_head, csa_kv*n_stream, 1);
-            cache.lid_k[(size_t) il] = ggml_new_tensor_3d(cache.cache_ctx, cparams.idx_type_k, n_indexer_head, lid_kv*n_stream, 1);
+            // Track H: the csa cache exists on its KV owner only (the ratio-2
+            // compressor runs there); the lid cache additionally exists on every index
+            // source, which writes its own index keys (see the hca branch).
+            const bool owner_kv = is_kv_owner(il);
+            const bool owner_lid = owner_kv || is_index_owner(il);
+
+            if (owner_kv) {
+                cache.csa_k[(size_t) il] = ggml_new_tensor_3d(cache.cache_ctx, comp_type_k, n_embd_head, csa_kv*n_stream, 1);
+                if (!alloc_tensor(cache.csa_k[(size_t) il], buft)) {
+                    LLAMA_LOG_ERROR("%s: failed to allocate DSV4 CSA buffers for layer %d\n", __func__, il);
+                    free_dsv4_cache_tensors();
+                    return false;
+                }
+                ++n_owner_csa;
+            }
+            if (owner_lid) {
+                cache.lid_k[(size_t) il] = ggml_new_tensor_3d(cache.cache_ctx, cparams.idx_type_k, n_indexer_head, lid_kv*n_stream, 1);
+                if (!alloc_tensor(cache.lid_k[(size_t) il], buft)) {
+                    LLAMA_LOG_ERROR("%s: failed to allocate DSV4 LID buffers for layer %d\n", __func__, il);
+                    free_dsv4_cache_tensors();
+                    return false;
+                }
+                ++n_owner_lid;
+            }
             cache.csa_state_kv[(size_t) il] = ggml_new_tensor_2d(cache.cache_ctx, GGML_TYPE_F32, csa_state_width*n_embd_head, csa_state_width*csa_ratio*n_stream);
             cache.csa_state_score[(size_t) il] = ggml_new_tensor_2d(cache.cache_ctx, GGML_TYPE_F32, csa_state_width*n_embd_head, csa_state_width*csa_ratio*n_stream);
             cache.lid_state_kv[(size_t) il] = ggml_new_tensor_2d(cache.cache_ctx, GGML_TYPE_F32, csa_state_width*n_indexer_head, csa_state_width*csa_ratio*n_stream);
             cache.lid_state_score[(size_t) il] = ggml_new_tensor_2d(cache.cache_ctx, GGML_TYPE_F32, csa_state_width*n_indexer_head, csa_state_width*csa_ratio*n_stream);
 
-            if (!alloc_tensor(cache.csa_k[(size_t) il], buft) ||
-                !alloc_tensor(cache.lid_k[(size_t) il], buft) ||
-                !alloc_tensor(cache.csa_state_kv[(size_t) il], buft) ||
+            if (!alloc_tensor(cache.csa_state_kv[(size_t) il], buft) ||
                 !alloc_tensor(cache.csa_state_score[(size_t) il], buft) ||
                 !alloc_tensor(cache.lid_state_kv[(size_t) il], buft) ||
                 !alloc_tensor(cache.lid_state_score[(size_t) il], buft)) {
-                LLAMA_LOG_ERROR("%s: failed to allocate DSV4 CSA/LID buffers for layer %d\n", __func__, il);
+                LLAMA_LOG_ERROR("%s: failed to allocate DSV4 CSA/LID state buffers for layer %d\n", __func__, il);
                 free_dsv4_cache_tensors();
                 return false;
             }
         } else if (ratio == hca_ratio) {
-            cache.hca_k[(size_t) il] = ggml_new_tensor_3d(cache.cache_ctx, comp_type_k, n_embd_head, hca_kv*n_stream, 1);
+            const bool owner_kv = is_kv_owner(il);
+            // Track H: a lid cache belongs to a KV owner (its group reads it through
+            // `dsv4_kv_src_layer[il]`) and to every V4.1 index source (the Reindex
+            // layers 24/28/32/36 WRITE their own index keys). V4's lid plan is csa-only
+            // and it allocates lid_k on the csa path below, so its hca layers keep none.
+            const bool owner_lid = model.arch == LLM_ARCH_DEEPSEEK41 && (owner_kv || is_index_owner(il));
+
+            if (owner_kv) {
+                cache.hca_k[(size_t) il] = ggml_new_tensor_3d(cache.cache_ctx, comp_type_k, n_embd_head, hca_kv*n_stream, 1);
+                if (!alloc_tensor(cache.hca_k[(size_t) il], buft)) {
+                    LLAMA_LOG_ERROR("%s: failed to allocate DSV4 HCA buffers for layer %d\n", __func__, il);
+                    free_dsv4_cache_tensors();
+                    return false;
+                }
+                ++n_owner_hca;
+            }
             cache.hca_state_kv[(size_t) il] = ggml_new_tensor_2d(cache.cache_ctx, GGML_TYPE_F32, n_embd_head, hca_ratio*n_stream);
             cache.hca_state_score[(size_t) il] = ggml_new_tensor_2d(cache.cache_ctx, GGML_TYPE_F32, n_embd_head, hca_ratio*n_stream);
 
-            if (!alloc_tensor(cache.hca_k[(size_t) il], buft) ||
-                !alloc_tensor(cache.hca_state_kv[(size_t) il], buft) ||
+            if (!alloc_tensor(cache.hca_state_kv[(size_t) il], buft) ||
                 !alloc_tensor(cache.hca_state_score[(size_t) il], buft)) {
-                LLAMA_LOG_ERROR("%s: failed to allocate DSV4 HCA buffers for layer %d\n", __func__, il);
+                LLAMA_LOG_ERROR("%s: failed to allocate DSV4 HCA state buffers for layer %d\n", __func__, il);
                 free_dsv4_cache_tensors();
                 return false;
             }
@@ -1075,14 +1135,25 @@ bool llama_context::ensure_dsv4_cache_tensors() {
             // address dst rows {0,1} against 1-row tensors, which failed the speculative
             // per-step checkpoint restore with
             //   "invalid visible DSV4 state row src=0 dst=1 state_rows=1".
-            if (model.arch == LLM_ARCH_DEEPSEEK41 && model.hparams.dsv4_is_index_source[(size_t) il]) {
+            //
+            // Track H: the lid cache itself is allocated from `owner_lid` above (a KV
+            // owner whose group reads it, or an index source that writes it); the state
+            // stays tied to the index-source layers that run the compressor.
+            if (owner_lid) {
                 cache.lid_k[(size_t) il] = ggml_new_tensor_3d(cache.cache_ctx, cparams.idx_type_k, n_indexer_head, lid_kv*n_stream, 1);
+                if (!alloc_tensor(cache.lid_k[(size_t) il], buft)) {
+                    LLAMA_LOG_ERROR("%s: failed to allocate DSV4 LID buffers for decoder layer %d\n", __func__, il);
+                    free_dsv4_cache_tensors();
+                    return false;
+                }
+                ++n_owner_lid;
+            }
+            if (model.arch == LLM_ARCH_DEEPSEEK41 && model.hparams.dsv4_is_index_source[(size_t) il]) {
                 cache.lid_state_kv[(size_t) il] = ggml_new_tensor_2d(cache.cache_ctx, GGML_TYPE_F32, n_indexer_head, csa_state_width*csa_ratio*n_stream);
                 cache.lid_state_score[(size_t) il] = ggml_new_tensor_2d(cache.cache_ctx, GGML_TYPE_F32, n_indexer_head, csa_state_width*csa_ratio*n_stream);
-                if (!alloc_tensor(cache.lid_k[(size_t) il], buft) ||
-                    !alloc_tensor(cache.lid_state_kv[(size_t) il], buft) ||
+                if (!alloc_tensor(cache.lid_state_kv[(size_t) il], buft) ||
                     !alloc_tensor(cache.lid_state_score[(size_t) il], buft)) {
-                    LLAMA_LOG_ERROR("%s: failed to allocate DSV4 LID buffers for decoder layer %d\n", __func__, il);
+                    LLAMA_LOG_ERROR("%s: failed to allocate DSV4 LID state buffers for decoder layer %d\n", __func__, il);
                     free_dsv4_cache_tensors();
                     return false;
                 }
@@ -1107,14 +1178,14 @@ bool llama_context::ensure_dsv4_cache_tensors() {
     const size_t hca_state_bytes = bytes(cache.hca_state_kv) + bytes(cache.hca_state_score);
     const size_t lid_state_bytes = bytes(cache.lid_state_kv) + bytes(cache.lid_state_score);
 
-    LLAMA_LOG_INFO("%s: DSV4 cache: CSA K=%7.2f MiB (%s), HCA K=%7.2f MiB (%s), LID K=%7.2f MiB (%s), states=%7.2f MiB, total=%7.2f MiB, streams=%u\n",
+    LLAMA_LOG_INFO("%s: DSV4 cache: CSA K=%7.2f MiB (%s), HCA K=%7.2f MiB (%s), LID K=%7.2f MiB (%s), states=%7.2f MiB, total=%7.2f MiB, streams=%u, compressed-K owners: csa=%u hca=%u lid=%u of %d layers\n",
             __func__,
             (float) csa_k_bytes / (1024.0f * 1024.0f), ggml_type_name(comp_type_k),
             (float) hca_k_bytes / (1024.0f * 1024.0f), ggml_type_name(comp_type_k),
             (float) lid_k_bytes / (1024.0f * 1024.0f), ggml_type_name(cparams.idx_type_k),
             (float) (csa_state_bytes + hca_state_bytes + lid_state_bytes) / (1024.0f * 1024.0f),
             (float) (csa_k_bytes + hca_k_bytes + lid_k_bytes + csa_state_bytes + hca_state_bytes + lid_state_bytes) / (1024.0f * 1024.0f),
-            n_stream);
+            n_stream, n_owner_csa, n_owner_hca, n_owner_lid, n_layer);
 
     return true;
 }

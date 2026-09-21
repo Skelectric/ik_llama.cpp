@@ -10996,6 +10996,12 @@ struct llama_data_write {
             write(&dsv4_stream_idx, sizeof(dsv4_stream_idx));
             write(&ctx->dsv4.cache.n_stream, sizeof(ctx->dsv4.cache.n_stream));
 
+            // NOTE (Track H): `layer_type` is derived from which compressed-K tensors the
+            // allocator created (llama-dsv4.cpp: `ensure_dsv4_cache_tensors`). This block is
+            // V4-only, and on V4 every compressing layer owns its own cache, so the layout is
+            // unchanged. If the owner rule is ever extended to V4, this format changes and
+            // LLAMA_STATE_SEQ_VERSION must be bumped (an old file would name a layer this
+            // build leaves null).
             for (uint32_t il = 0; il < n_layer; ++il) {
                 uint32_t layer_type = 0;
                 if (il < ctx->dsv4.cache.csa_k.size() && ctx->dsv4.cache.csa_k[il] != nullptr) {

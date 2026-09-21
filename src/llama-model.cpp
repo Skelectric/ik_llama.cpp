@@ -2830,17 +2830,33 @@ size_t llama_model::cache_size(int il, ggml_type type_k, ggml_type type_v, ggml_
         const uint32_t raw_pad = llama_kv_cache::get_padding(flash_attn);
         const uint32_t k_rows = llama_kv_layer_rows(hparams, il, kv_size, swa_compress, n_ubatch, raw_pad);
         size_t size = ggml_row_size(type_k, n_embd_head) * hparams.n_head_kv(il) * k_rows;
+        // Track H (H.2): mirror the allocator's owner-layer rule - a non-owner layer
+        // reserves no compressed-K tensor (it neither writes nor reads one; the
+        // readers resolve through `dsv4_kv_src_layer[il]`). The lid cache is allocated
+        // for the union of the KV owners and the index owners (the Reindex layers
+        // write their own lid cache). V4 has no non-owner compressing layer, so this
+        // is a no-op there.
+        const bool owner_kv  = arch != LLM_ARCH_DEEPSEEK41 || hparams.dsv4_is_kv_source[(size_t) il];
+        const bool owner_lid = owner_kv || arch != LLM_ARCH_DEEPSEEK41 || hparams.dsv4_is_index_source[(size_t) il];
         if (ratio == csa_ratio) {
-            size += ggml_row_size(type_k, n_embd_head) * csa_kv * n_stream;
-            size += ggml_row_size(idx_type_k, n_indexer_head) * lid_kv * n_stream;
+            if (owner_kv) {
+                size += ggml_row_size(type_k, n_embd_head) * csa_kv * n_stream;
+            }
+            if (owner_lid) {
+                size += ggml_row_size(idx_type_k, n_indexer_head) * lid_kv * n_stream;
+            }
             size += (size_t) 2 * n_embd_head * csa_state_width * csa_ratio * n_stream * sizeof(float) * csa_state_width;
             size += (size_t) 2 * n_indexer_head * csa_state_width * csa_ratio * n_stream * sizeof(float) * csa_state_width;
         } else if (ratio == hca_ratio) {
-            size += ggml_row_size(type_k, n_embd_head) * hca_kv * n_stream;
+            if (owner_kv) {
+                size += ggml_row_size(type_k, n_embd_head) * hca_kv * n_stream;
+            }
             size += (size_t) n_embd_head * hca_ratio * n_stream * sizeof(float) * 2;
             if (arch == LLM_ARCH_DEEPSEEK41 && hparams.dsv4_is_index_source[(size_t) il]) {
-                // V4.1 decoder index-source layers own a LID cache (see the allocator)
-                size += ggml_row_size(idx_type_k, n_indexer_head) * lid_kv * n_stream;
+                // V4.1 decoder index-source layers write a LID cache (see the allocator)
+                if (owner_lid) {
+                    size += ggml_row_size(idx_type_k, n_indexer_head) * lid_kv * n_stream;
+                }
                 size += (size_t) 2 * n_indexer_head * csa_state_width * csa_ratio * n_stream * sizeof(float) * csa_state_width;
             }
         }
