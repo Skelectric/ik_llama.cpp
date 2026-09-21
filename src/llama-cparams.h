@@ -59,6 +59,11 @@ struct llama_cparams {
 
     enum ggml_type reduce_type;
     enum ggml_type graph_attn_precision;
+    // The main KV-cache types as requested by the context params. The main cache itself keeps
+    // them in llama_kv_cache; the dflash draft's own window cache (which is not that cache) reads
+    // them from here (Phase 4 Track G).
+    enum ggml_type type_k = GGML_TYPE_F16;
+    enum ggml_type type_v = GGML_TYPE_F16;
     enum ggml_type idx_type_k = GGML_TYPE_F16;
     enum llama_pooling_type pooling_type;
     enum llama_mtp_op_type mtp_op_type;

@@ -9022,6 +9022,8 @@ struct llama_context * llama_init_from_model(
 
     cparams.reduce_type      = params.type_reduce;
     cparams.graph_attn_precision = params.type_graph_attn;
+    cparams.type_k           = params.type_k;
+    cparams.type_v           = params.type_v;
     cparams.idx_type_k       = params.idx_type_k;
     // The packed storage types are implemented for the DeepSeek-V4 family (and its dflash
     // draft) only. Refuse them everywhere else rather than letting an unknown cache type

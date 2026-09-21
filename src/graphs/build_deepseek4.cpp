@@ -2409,6 +2409,38 @@ ggml_cgraph * llm_build_context::build_deepseek41() {
     return gf;
 }
 
+// Phase 4 (Track G): the draft's window cache read. A packed (storage-only) type has no
+// vec_dot, so the flash-attention K/V cannot be the cache itself: gather the visible rows
+// [0, n_rows) through the host-filled identity index and cast the F32 dequantiser output
+// to F16 - the same shape as the backbone window read (dsv4_raw_get_k_window). An f16/f32
+// cache keeps the historical path (the view, then cast F32 -> F16).
+static ggml_tensor * dflash_kv_read_f16(
+        ggml_context * ctx,
+        ggml_tensor  * cache,
+        ggml_tensor  * idxs,
+        int64_t        n_rows,
+        const llm_build_cb & cb,
+        int            il,
+        const char   * name) {
+    GGML_ASSERT(cache != nullptr);
+    GGML_ASSERT(n_rows > 0 && n_rows <= cache->ne[1]);
+
+    if (!llama_is_packed_kv_cache_type(cache->type)) {
+        ggml_tensor * view = ggml_view_3d(ctx, cache, cache->ne[0], n_rows, cache->ne[2],
+                cache->nb[1], cache->nb[2], 0);
+        return cache->type == GGML_TYPE_F32 ? ggml_cast(ctx, view, GGML_TYPE_F16) : view;
+    }
+
+    GGML_ASSERT(idxs != nullptr && idxs->type == GGML_TYPE_I32 && idxs->ne[0] >= n_rows);
+    ggml_tensor * rows = idxs->ne[0] == n_rows ? idxs : ggml_view_1d(ctx, idxs, n_rows, 0);
+    ggml_tensor * cache_2d = ggml_view_2d(ctx, cache, cache->ne[0], cache->ne[1]*cache->ne[2],
+            cache->nb[1], 0);
+    ggml_tensor * back = ggml_get_rows(ctx, cache_2d, rows);
+    cb(back, name, il);
+    back = ggml_cast(ctx, back, GGML_TYPE_F16);
+    return ggml_reshape_3d(ctx, back, cache->ne[0], n_rows, cache->ne[2]);
+}
+
 ggml_cgraph * llm_build_context::build_dflash_dsv4() {
     const int64_t n_embd_head = hparams.n_embd_head_k(0);
     const int64_t n_embd_head_rope = hparams.n_rot;
@@ -2447,6 +2479,17 @@ ggml_cgraph * llm_build_context::build_dflash_dsv4() {
     lctx.dflash.kv.draft_tail_rows_tensor = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
     ggml_set_input(lctx.dflash.kv.draft_tail_rows_tensor);
     cb(lctx.dflash.kv.draft_tail_rows_tensor, "dflash_draft_tail_rows", -1);
+
+    // Phase 4 (Track G): a packed draft window cache is read through a host-filled identity
+    // row index (see dflash_kv_read_f16). Cleared every build so a graph that does not read
+    // a packed cache cannot inherit the previous graph's (freed) tensor; created only when
+    // the cache is packed (an input with no consumer is never allocated).
+    lctx.dflash.kv.kv_read_idxs = nullptr;
+    if (!lctx.dflash.kv.k_ctx_cache.empty() &&
+            llama_is_packed_kv_cache_type(lctx.dflash.kv.k_ctx_cache[0]->type)) {
+        dsv4_new_i32_input(ctx0, &lctx.dflash.kv.kv_read_idxs, n_kv_total, "dsv4_dflash_kv_read_idxs");
+        cb(lctx.dflash.kv.kv_read_idxs, "dsv4_dflash_kv_read_idxs", -1);
+    }
 
     ggml_tensor * tok_embd = model.tok_embd;
     GGML_ASSERT(tok_embd != nullptr);
@@ -2492,18 +2535,10 @@ ggml_cgraph * llm_build_context::build_dflash_dsv4() {
         cb(Vcur, "dsv4_dflash_v_set_tail", il);
         ggml_build_forward_expand(gf, Kcur);
         ggml_build_forward_expand(gf, Vcur);
-        Kcur = ggml_view_3d(ctx0, lctx.dflash.kv.k_ctx_cache[il],
-                lctx.dflash.kv.k_ctx_cache[il]->ne[0], n_kv_total,
-                lctx.dflash.kv.k_ctx_cache[il]->ne[2],
-                lctx.dflash.kv.k_ctx_cache[il]->nb[1],
-                lctx.dflash.kv.k_ctx_cache[il]->nb[2], 0);
-        Vcur = ggml_view_3d(ctx0, lctx.dflash.kv.v_ctx_cache[il],
-                lctx.dflash.kv.v_ctx_cache[il]->ne[0], n_kv_total,
-                lctx.dflash.kv.v_ctx_cache[il]->ne[2],
-                lctx.dflash.kv.v_ctx_cache[il]->nb[1],
-                lctx.dflash.kv.v_ctx_cache[il]->nb[2], 0);
-        if (Kcur->type == GGML_TYPE_F32) { Kcur = ggml_cast(ctx0, Kcur, GGML_TYPE_F16); }
-        if (Vcur->type == GGML_TYPE_F32) { Vcur = ggml_cast(ctx0, Vcur, GGML_TYPE_F16); }
+        Kcur = dflash_kv_read_f16(ctx0, lctx.dflash.kv.k_ctx_cache[il], lctx.dflash.kv.kv_read_idxs,
+                n_kv_total, cb, il, "dsv4_dflash_k_read");
+        Vcur = dflash_kv_read_f16(ctx0, lctx.dflash.kv.v_ctx_cache[il], lctx.dflash.kv.kv_read_idxs,
+                n_kv_total, cb, il, "dsv4_dflash_v_read");
 
         ggml_tensor * q_attn = ggml_permute(ctx0, q, 0, 2, 1, 3);
         ggml_tensor * mask = lctx.dflash.inputs.kq_mask_swa;

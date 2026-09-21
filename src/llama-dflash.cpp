@@ -57,13 +57,27 @@ static ggml_backend_t llama_backend_for_tensor(const llama_context & lctx, const
     return nullptr;
 }
 
+// Phase 4 (Track G): the draft's window KV takes the same storage type as the backbone
+// window (-ctkd, falling back to -ctk). A packed (storage-only) type is honoured only
+// under --packed-kv-cache, only for the DSV4-style draft (the V4.1 DSpark attention -
+// the variant the reference rounds, model.py:1062) and only with flash-attention (a
+// packed type has no non-FA read path). The draft's V mirrors its K (the reference's
+// DSparkAttention carries a single kv tensor), so one type covers both.
+static ggml_type dflash_kv_cache_type(const llama_cparams & cparams, const llama_hparams & hparams) {
+    if (cparams.packed_kv_cache && hparams.dflash_dsv4 && cparams.flash_attn &&
+            llama_is_packed_kv_cache_type(cparams.type_k)) {
+        return cparams.type_k;
+    }
+    return cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
+}
+
 bool llama_context::ensure_dflash_kv_cache_tensors(int32_t cross_ctx) {
     const int32_t target_cross_ctx = std::max<int32_t>(1, cross_ctx);
     const int32_t target_token_capacity = std::max<int32_t>(
             std::max<int32_t>(1, (int32_t) model.hparams.dflash_block_size),
             cparams.dflash_query_capacity);
     const int32_t target_cache_n_kv_total = GGML_PAD(target_cross_ctx + target_token_capacity, (int32_t) llama_kv_cache::get_padding(cparams.flash_attn));
-    const ggml_type target_cache_type = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
+    const ggml_type target_cache_type = dflash_kv_cache_type(cparams, model.hparams);
     const int32_t n_layer = model.hparams.n_layer;
     const int64_t n_embd_head_k = model.hparams.n_embd_head_k(0);
     const int64_t n_embd_head_v = model.hparams.n_embd_head_v(0);
@@ -92,6 +106,12 @@ bool llama_context::ensure_dflash_kv_cache_tensors(int32_t cross_ctx) {
         dflash.kv.cache_graph = nullptr;
         dflash.kv.cache_graph_rows = 0;
         dflash.kv.cache_graph_write_pos = 0;
+    }
+
+    if (llama_is_packed_kv_cache_type(cparams.type_k) && !llama_is_packed_kv_cache_type(target_cache_type)) {
+        LLAMA_LOG_WARN("%s: the packed KV-cache type %s is not implemented for this draft "
+                "(DSV4-style dflash with flash-attention only); keeping %s\n",
+                __func__, ggml_type_name(cparams.type_k), ggml_type_name(target_cache_type));
     }
 
     ggml_init_params params = {
@@ -205,6 +225,7 @@ void llama_context::free_dflash_kv_cache_tensors() {
     dflash.kv.kq_mask_tensor = nullptr;
     dflash.kv.kq_mask_swa_tensor = nullptr;
     dflash.kv.draft_tail_rows_tensor = nullptr;
+    dflash.kv.kv_read_idxs = nullptr;
 
     for (ggml_backend_buffer_t buf : dflash.kv.cache_bufs) {
         if (buf != nullptr) {
@@ -652,6 +673,20 @@ bool llama_prepare_dflash_graph_inputs(
         draft_tail_rows_data[(size_t) i] = cross_ctx + (int32_t) i;
     }
     ggml_backend_tensor_set(draft_tail_rows, draft_tail_rows_data.data(), 0, ggml_nbytes(draft_tail_rows));
+
+    // Phase 4 (Track G): the packed draft window cache is read through this identity row
+    // index (created in the graph only when the cache is a packed type). The visible rows
+    // are the contiguous prefix [0, n_kv_total), so the index is the identity - the same
+    // values every step.
+    if (lctx.dflash.kv.kv_read_idxs != nullptr) {
+        const int64_t n_rows = lctx.dflash.kv.kv_read_idxs->ne[0];
+        std::vector<int32_t> kv_read_idxs_data((size_t) n_rows);
+        for (int64_t i = 0; i < n_rows; ++i) {
+            kv_read_idxs_data[(size_t) i] = (int32_t) i;
+        }
+        ggml_backend_tensor_set(lctx.dflash.kv.kv_read_idxs, kv_read_idxs_data.data(), 0,
+                ggml_nbytes(lctx.dflash.kv.kv_read_idxs));
+    }
 
     // TEMP-DEBUG (dspark): dump the draft attention geometry
     if (getenv("DSPARK_DUMP")) {

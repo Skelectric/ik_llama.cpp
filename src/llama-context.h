@@ -467,6 +467,13 @@ struct llama_context {
             struct ggml_tensor * kq_mask_tensor = nullptr;
             struct ggml_tensor * kq_mask_swa_tensor = nullptr;
             struct ggml_tensor * draft_tail_rows_tensor = nullptr;
+            // Phase 4 (Track G): identity row index for reading a packed draft window
+            // cache. A packed (storage-only) type has no vec_dot, so the flash-attention
+            // K/V are gathered through ggml_get_rows over this index. I32 [n_kv_total],
+            // host-filled, created only when the draft cache is a packed type
+            // (llama_is_packed_kv_cache_type); an in-graph ggml_arange would need an
+            // F32->I32 cast kernel, which the CPU backend does not have.
+            struct ggml_tensor * kv_read_idxs = nullptr;
         };
 
         struct capture_state {
