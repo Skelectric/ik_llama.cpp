@@ -1900,6 +1900,18 @@ bool llama_prepare_dsv4_graph_inputs(llama_context & lctx, const llama_batch & b
     dsv4_set_input_tensor(lctx.dsv4.inputs.raw_k_write_idxs, lctx.dsv4.raw.write_dst_idxs);
     dsv4_set_input_tensor(lctx.dsv4.inputs.raw_k_read_idxs, lctx.dsv4.raw.read_dst_idxs);
 
+    // Phase 4 (Track F.4): the packed compacted window is gathered through a host-filled index of
+    // its live rows [win_off, win_off + w_view). The tensor is created only when such a layer is
+    // walked (and its buffer exists only then), so the nullptr guard is the feature check.
+    if (lctx.dsv4.inputs.raw_k_window_idxs != nullptr) {
+        const int64_t n_rows = lctx.dsv4.inputs.raw_k_window_idxs->ne[0];
+        std::vector<int32_t> window_idxs((size_t) n_rows);
+        for (int64_t i = 0; i < n_rows; ++i) {
+            window_idxs[(size_t) i] = (int32_t) (lctx.swa_window_view.win_off + i);
+        }
+        dsv4_set_input_tensor(lctx.dsv4.inputs.raw_k_window_idxs, window_idxs);
+    }
+
     auto set_comp = [&](llama_context::dsv4_runtime::comp_inputs & inputs, llama_context::dsv4_runtime::comp_plan & plan, bool set_mask) {
         dsv4_set_input_tensor(inputs.state_pos, plan.state_pos);
         dsv4_set_input_tensor(inputs.state_persist_src_idxs, plan.state_persist_src_idxs);

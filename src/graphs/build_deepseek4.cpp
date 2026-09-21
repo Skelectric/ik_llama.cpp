@@ -466,6 +466,47 @@ static ggml_tensor * dsv4_raw_get_k(
     return raw_k;
 }
 
+// Phase 4 (Track F.4): the compacted layout reads only the live window rows
+// [win_off, win_off + w_view) - a contiguous slice of the cache. An f16/q8 window keeps the
+// zero-cost view; a packed (storage-only) window has no vec_dot, so it is dequantised
+// through a gather over a host-filled index of exactly those rows, the way the dense packed
+// read dequantises (dsv4_raw_get_k). The gathered rows keep the view's order: the window
+// mask (KQ_mask_swa_win) is column-exact for them.
+static ggml_tensor * dsv4_raw_get_k_window(
+        ggml_context * ctx,
+        ggml_tensor  * cache,
+        ggml_tensor  * window_idxs,
+        int64_t        win_off,
+        int64_t        w_view,
+        int64_t        n_embd_head,
+        const llm_build_cb & cb,
+        int            il) {
+    if (cache == nullptr) {
+        return nullptr;
+    }
+
+    if (!llama_is_packed_kv_cache_type(cache->type)) {
+        const size_t row_size = ggml_row_size(cache->type, n_embd_head);
+        return ggml_view_3d(ctx, cache, n_embd_head, 1, w_view,
+                row_size, row_size, row_size*(size_t) win_off);
+    }
+
+    GGML_ASSERT(window_idxs != nullptr);
+    GGML_ASSERT(window_idxs->ne[0] >= w_view);
+
+    ggml_tensor * cache_2d = dsv4_cache_view_2d(ctx, cache, n_embd_head, cache->ne[1]);
+    ggml_tensor * idxs = window_idxs->type == GGML_TYPE_I32
+            ? window_idxs : ggml_cast(ctx, window_idxs, GGML_TYPE_I32);
+    if (idxs->ne[0] > w_view) {
+        idxs = ggml_view_1d(ctx, idxs, w_view, 0);
+    }
+    ggml_tensor * rows = ggml_get_rows(ctx, cache_2d, idxs);
+    cb(rows, "raw_k", il);
+    // the dequantising get_rows returns F32; the FA operand must be a compute type
+    rows = ggml_cast(ctx, rows, GGML_TYPE_F16);
+    return ggml_reshape_4d(ctx, rows, n_embd_head, 1, w_view, 1);
+}
+
 static ggml_tensor * dsv4_raw_cpy_k(
         llama_context * lctx,
         ggml_context  * ctx,
@@ -1568,10 +1609,8 @@ static ggml_tensor * ds4_attention(ggml_cgraph * gf, ggml_context * ctx0, llm_bu
     if (raw_compacted) {
         // live window rows [win_off, win_off + w_view); KQ_mask_swa_win is that view's column-exact mask
         GGML_ASSERT(hparams.n_head_kv(il) == 1 && KQ_mask_swa_win != nullptr && lctx.swa_window_view.active);
-        const size_t row_size = ggml_row_size(kv_self.k_l[il]->type, n_embd_head);
-        raw_k = ggml_view_3d(ctx0, kv_self.k_l[il],
-                n_embd_head, 1, lctx.swa_window_view.w_view,
-                row_size, row_size, row_size*(size_t) lctx.swa_window_view.win_off);
+        raw_k = dsv4_raw_get_k_window(ctx0, kv_self.k_l[il], lctx.dsv4.inputs.raw_k_window_idxs,
+                lctx.swa_window_view.win_off, lctx.swa_window_view.w_view, n_embd_head, cb, il);
         raw_mask = KQ_mask_swa_win;
     } else if (hparams.n_head_kv(il) == 1 && read_idxs != nullptr) {
         raw_k = dsv4_raw_get_k(&lctx, ctx0, kv_self.k_l[il], read_idxs, n_embd_head, cb, il);
@@ -1852,6 +1891,10 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
     dsv4_new_comp_k_read_idxs_input(ctx0, lctx, lctx.dsv4.inputs.hca, lctx.dsv4.hca_ctx, "dsv4_hca_k_read_idxs");
     dsv4_new_lid_q_round_idxs_input(ctx0, lctx);
 
+    // Phase 4 (Track F.4): cleared every build so a graph that walks no compacted layer cannot
+    // inherit the previous graph's (freed) window index tensor; created below when needed.
+    lctx.dsv4.inputs.raw_k_window_idxs = nullptr;
+
     ggml_tensor * inp_pos = build_inp_pos();
     // build only the mask the graph consumes; an input tensor without a consumer is never allocated
     ggml_tensor * KQ_mask = nullptr;
@@ -1869,6 +1912,14 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
             bool KQ_mask_swa_windowed = false;
             KQ_mask_swa_win = build_swa_mask_for_graph(hparams.n_swa, /* compacted = */ true, &KQ_mask_swa_windowed);
             GGML_ASSERT(KQ_mask_swa_windowed && KQ_mask_swa_win != nullptr);
+            // Phase 4 (Track F.4): a packed window is storage-only, so the compacted read gathers its
+            // live rows through this host-filled index instead of taking a plain view. Created only
+            // when a compacted layer is walked (an input with no consumer is never allocated); the
+            // values are set in llama_prepare_dsv4_graph_inputs.
+            if (llama_is_packed_kv_cache_type(kv_self.type_k)) {
+                dsv4_new_i32_input(ctx0, &lctx.dsv4.inputs.raw_k_window_idxs,
+                        (int64_t) lctx.swa_window_view.w_view, "dsv4_raw_k_window_idxs");
+            }
         }
         if (walked_dense) {
             KQ_mask = hparams.n_swa > 0 ? build_inp_KQ_mask_swa() : build_inp_KQ_mask();
@@ -2176,6 +2227,10 @@ ggml_cgraph * llm_build_context::build_deepseek41() {
     dsv4_new_comp_k_read_idxs_input(ctx0, lctx, lctx.dsv4.inputs.hca, lctx.dsv4.hca_ctx, "dsv4_hca_k_read_idxs");
     dsv4_new_lid_q_round_idxs_input(ctx0, lctx);
 
+    // Phase 4 (Track F.4): see build_deepseek4 - cleared every build, created below when a
+    // compacted layer is walked.
+    lctx.dsv4.inputs.raw_k_window_idxs = nullptr;
+
     ggml_tensor * inp_pos = build_inp_pos();
 
     // V4.1's GGUF has block_count = backbone only (no MTP blocks in the file);
@@ -2199,6 +2254,12 @@ ggml_cgraph * llm_build_context::build_deepseek41() {
             bool KQ_mask_swa_windowed = false;
             KQ_mask_swa_win = build_swa_mask_for_graph(hparams.n_swa, /* compacted = */ true, &KQ_mask_swa_windowed);
             GGML_ASSERT(KQ_mask_swa_windowed && KQ_mask_swa_win != nullptr);
+            // Phase 4 (Track F.4): see build_deepseek4 - the packed compacted window reads through a
+            // host-filled index of its live rows.
+            if (llama_is_packed_kv_cache_type(kv_self.type_k)) {
+                dsv4_new_i32_input(ctx0, &lctx.dsv4.inputs.raw_k_window_idxs,
+                        (int64_t) lctx.swa_window_view.w_view, "dsv4_raw_k_window_idxs");
+            }
         }
         if (walked_dense) {
             KQ_mask = hparams.n_swa > 0 ? build_inp_KQ_mask_swa() : build_inp_KQ_mask();

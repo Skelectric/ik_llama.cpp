@@ -635,6 +635,9 @@ struct llama_context {
             struct ggml_tensor * raw_k_write_src_idxs = nullptr;
             struct ggml_tensor * raw_k_write_idxs = nullptr;
             struct ggml_tensor * raw_k_read_idxs = nullptr;
+            // Phase 4 (Track F.4): the live window rows of a packed compacted cache, gathered
+            // by the read (a packed window cannot be a plain view - it has no vec_dot).
+            struct ggml_tensor * raw_k_window_idxs = nullptr;
             comp_inputs csa;
             comp_inputs hca;
             comp_inputs lid;
