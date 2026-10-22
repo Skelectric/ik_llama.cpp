@@ -684,6 +684,27 @@ void llama_begin_dflash_capture_batch(struct llama_context * ctx, int32_t expect
     }
 }
 
+void llama_begin_dflash_capture_ubatch(struct llama_context * ctx, int32_t expected_rows) {
+    if (ctx == nullptr || !ctx->dflash.capture) {
+        return;
+    }
+
+    auto & capture = *ctx->dflash.capture;
+    if (capture.readback_pending) {
+        llama_synchronize(ctx);
+        capture.readback_pending = false;
+    }
+    capture.row_count = 0;
+    capture.row_width = 0;
+    capture.expected_rows = expected_rows;
+    capture.invalid = expected_rows <= 0;
+    std::fill(capture.layer_rows_written.begin(), capture.layer_rows_written.end(), 0);
+    std::fill(capture.layer_seen_batch_id.begin(), capture.layer_seen_batch_id.end(), 0);
+    for (auto & chunks : capture.layer_chunks) {
+        chunks.clear();
+    }
+}
+
 void llama_finish_dflash_capture_batch(
         struct llama_context * ctx,
         bool is_prompt_warmup) {
