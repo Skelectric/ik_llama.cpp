@@ -2865,6 +2865,231 @@ static size_t load_checkpoints_from_file(const std::string & filename, std::list
     return pos;
 }
 
+// ---- incremental ring storage -------------------------------------------
+// A save used to rewrite the whole ring, but between two saves only one entry is
+// new: the ring evicts its oldest entry and appends one at the current position.
+// Rewriting 16 blobs to store 1 is why a 456k-token save was 15.5 GB of sidecar
+// against 1.7 GB of .bin. The ring is stored as one file per entry plus a
+// manifest instead:
+//
+//   <filepath>.checkpoints/              directory
+//     manifest                           magic, version, count, then per entry
+//                                        pos_min, pos_max, n_tokens, data_len,
+//                                        name_len, name
+//     e-<pos_max>-<n_tokens>-<hash>.bin  one entry, in the single-entry format
+//                                        save_checkpoints_to_file already writes
+//
+// The name carries a hash of the token prefix that produced the entry, so an
+// entry is reused only when that prefix is unchanged. A rewind changes the
+// prefix (compaction, a truncated prompt), which changes the name, so the entry
+// is written fresh instead of being silently reused.
+static const char * CKPT_MANIFEST_NAME = "manifest";
+static const uint32_t CKPT_RING_VERSION = 1;
+
+static uint64_t ckpt_prefix_hash(const llama_token * tokens, size_t n_tokens) {
+    // FNV-1a: only has to distinguish prefixes, not resist attack.
+    uint64_t h = 1469598103934665603ULL;
+    for (size_t i = 0; i < n_tokens; i++) {
+        const uint32_t v = (uint32_t) tokens[i];
+        for (int b = 0; b < 4; b++) {
+            h ^= (v >> (8 * b)) & 0xff;
+            h *= 1099511628211ULL;
+        }
+    }
+    return h;
+}
+
+// File name holding this entry's blob, or "" when there is no resident blob to
+// store (a spilled entry keeps its positions only, as the single-file format did).
+static std::string ckpt_entry_name(const server_prompt_checkpoint & ckpt, const llama_token * tokens, size_t n_tokens) {
+    if (ckpt.data.empty()) {
+        return std::string();
+    }
+    size_t n = ckpt.n_tokens > 0 ? (size_t) ckpt.n_tokens : 0;
+    if (n > n_tokens) {
+        n = n_tokens;
+    }
+    char buf[128];
+    snprintf(buf, sizeof(buf), "e-%d-%lld-%016llx.bin",
+        (int) ckpt.pos_max, (long long) ckpt.n_tokens,
+        (unsigned long long) ckpt_prefix_hash(tokens, n));
+    return std::string(buf);
+}
+
+// Write one entry as a complete single-checkpoint file.
+static size_t save_checkpoint_entry(const std::string & path, const server_prompt_checkpoint & checkpoint) {
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    if (!file.is_open()) {
+        LLAMA_LOG_ERROR("%s: cannot write %s\n", __func__, path.c_str());
+        return 0;
+    }
+    uint32_t magic = LLAMA_STATE_SEQ_MAGIC;
+    file.write(reinterpret_cast<const char *>(&magic), sizeof(magic));
+    uint32_t version = LLAMA_STATE_SEQ_VERSION;
+    file.write(reinterpret_cast<const char *>(&version), sizeof(version));
+    size_t count = 1;
+    file.write(reinterpret_cast<const char *>(&count), sizeof(count));
+    file.write(reinterpret_cast<const char *>(&checkpoint.pos_min), sizeof(checkpoint.pos_min));
+    file.write(reinterpret_cast<const char *>(&checkpoint.pos_max), sizeof(checkpoint.pos_max));
+    file.write(reinterpret_cast<const char *>(&checkpoint.n_tokens), sizeof(checkpoint.n_tokens));
+    size_t data_len = checkpoint.data.size();
+    file.write(reinterpret_cast<const char *>(&data_len), sizeof(data_len));
+    if (data_len > 0) {
+        file.write(reinterpret_cast<const char *>(checkpoint.data.data()), data_len);
+    }
+    size_t pos = file.tellp();
+    file.close();
+    return pos;
+}
+
+// Save the ring into a directory, writing only the entries the previous save did
+// not already hold. Returns the bytes actually written.
+static size_t save_checkpoints_ring(const std::string & dir, const std::list<server_prompt_checkpoint> & checkpoints,
+                                    const llama_token * tokens, size_t n_tokens) {
+    if (checkpoints.empty()) {
+        return 0;
+    }
+    std::error_code ec;
+    if (!std::filesystem::is_directory(dir, ec)) {
+        // a legacy single-file ring sits at this path: the directory supersedes it
+        std::filesystem::remove(dir, ec);
+        std::filesystem::create_directories(dir, ec);
+        if (!std::filesystem::is_directory(dir, ec)) {
+            LLAMA_LOG_ERROR("%s: cannot create ring directory %s\n", __func__, dir.c_str());
+            return 0;
+        }
+    }
+    std::vector<std::string> keep;
+    keep.reserve(checkpoints.size());
+    size_t reused = 0;
+    size_t written = 0;
+    for (const auto & checkpoint : checkpoints) {
+        const std::string name = ckpt_entry_name(checkpoint, tokens, n_tokens);
+        keep.push_back(name);
+        if (name.empty()) {
+            continue;
+        }
+        const std::string path = dir + "/" + name;
+        if (std::filesystem::exists(path, ec) && std::filesystem::file_size(path, ec) > 0) {
+            reused++;
+            continue; // byte-identical to the previous save: keep the file
+        }
+        written += save_checkpoint_entry(path, checkpoint);
+    }
+    // Manifest last and by rename: a save that dies before this point leaves the
+    // previous manifest, which lists only entries complete at its write time.
+    const std::string manifest = dir + "/" + CKPT_MANIFEST_NAME;
+    const std::string tmp      = manifest + ".tmp";
+    {
+        std::ofstream file(tmp, std::ios::binary | std::ios::trunc);
+        if (!file.is_open()) {
+            LLAMA_LOG_ERROR("%s: cannot write %s\n", __func__, tmp.c_str());
+            return written;
+        }
+        uint32_t magic = LLAMA_STATE_SEQ_MAGIC;
+        file.write(reinterpret_cast<const char *>(&magic), sizeof(magic));
+        uint32_t version = CKPT_RING_VERSION;
+        file.write(reinterpret_cast<const char *>(&version), sizeof(version));
+        size_t count = keep.size();
+        file.write(reinterpret_cast<const char *>(&count), sizeof(count));
+        size_t i = 0;
+        for (const auto & checkpoint : checkpoints) {
+            const std::string & name = keep[i++];
+            file.write(reinterpret_cast<const char *>(&checkpoint.pos_min), sizeof(checkpoint.pos_min));
+            file.write(reinterpret_cast<const char *>(&checkpoint.pos_max), sizeof(checkpoint.pos_max));
+            file.write(reinterpret_cast<const char *>(&checkpoint.n_tokens), sizeof(checkpoint.n_tokens));
+            size_t data_len = checkpoint.data.size();
+            file.write(reinterpret_cast<const char *>(&data_len), sizeof(data_len));
+            size_t name_len = name.size();
+            file.write(reinterpret_cast<const char *>(&name_len), sizeof(name_len));
+            if (name_len > 0) {
+                file.write(name.data(), name_len);
+            }
+        }
+        file.close();
+    }
+    std::filesystem::rename(tmp, manifest, ec);
+    // Drop the entries the ring no longer holds: the evicted one, plus any blob a
+    // rewind left behind under a name the current ring does not use.
+    for (const auto & entry : std::filesystem::directory_iterator(dir, ec)) {
+        const std::string fn = entry.path().filename().string();
+        if (fn == CKPT_MANIFEST_NAME || fn == std::string(CKPT_MANIFEST_NAME) + ".tmp") {
+            continue;
+        }
+        bool used = false;
+        for (const auto & name : keep) {
+            if (name == fn) {
+                used = true;
+                break;
+            }
+        }
+        if (!used) {
+            std::error_code rm_ec;
+            std::filesystem::remove(entry.path(), rm_ec);
+        }
+    }
+    LLAMA_LOG_INFO("%s: ring %zu entries, %zu reused, %zu written (%.1f MiB)\n",
+        __func__, keep.size(), reused, keep.size() - reused, written / (1024.0 * 1024.0));
+    return written;
+}
+
+// Load a ring directory; falls back to the single-file format for saves written
+// before the directory layout.
+static size_t load_checkpoints_ring(const std::string & dir, std::list<server_prompt_checkpoint> & checkpoints) {
+    std::error_code ec;
+    if (!std::filesystem::is_directory(dir, ec)) {
+        return load_checkpoints_from_file(dir, checkpoints);
+    }
+    clear_checkpoints_and_spill(checkpoints);
+    std::ifstream file(dir + "/" + CKPT_MANIFEST_NAME, std::ios::binary);
+    if (!file.is_open()) {
+        LLAMA_LOG_WARN("%s: no manifest in %s, restoring without a ring\n", __func__, dir.c_str());
+        return 0;
+    }
+    uint32_t magic = 0;
+    file.read(reinterpret_cast<char *>(&magic), sizeof(magic));
+    uint32_t version = 0;
+    file.read(reinterpret_cast<char *>(&version), sizeof(version));
+    if (magic != LLAMA_STATE_SEQ_MAGIC || version != CKPT_RING_VERSION) {
+        LLAMA_LOG_ERROR("%s: unknown (magic, version) for ring manifest: %08x, %08x\n", __func__, magic, version);
+        return 0;
+    }
+    size_t count = 0;
+    file.read(reinterpret_cast<char *>(&count), sizeof(count));
+    size_t total = 0;
+    size_t missing = 0;
+    for (size_t i = 0; i < count; i++) {
+        server_prompt_checkpoint meta;
+        size_t data_len = 0;
+        size_t name_len = 0;
+        file.read(reinterpret_cast<char *>(&meta.pos_min), sizeof(meta.pos_min));
+        file.read(reinterpret_cast<char *>(&meta.pos_max), sizeof(meta.pos_max));
+        file.read(reinterpret_cast<char *>(&meta.n_tokens), sizeof(meta.n_tokens));
+        file.read(reinterpret_cast<char *>(&data_len), sizeof(data_len));
+        file.read(reinterpret_cast<char *>(&name_len), sizeof(name_len));
+        std::string name;
+        if (name_len > 0) {
+            name.resize(name_len);
+            file.read(name.data(), name_len);
+        }
+        if (name.empty()) {
+            checkpoints.push_back(meta); // spilled entry: positions only
+            continue;
+        }
+        std::list<server_prompt_checkpoint> loaded;
+        total += load_checkpoints_from_file(dir + "/" + name, loaded);
+        if (loaded.size() != 1) {
+            missing++;
+            continue;
+        }
+        checkpoints.push_back(std::move(loaded.front()));
+    }
+    if (missing > 0) {
+        LLAMA_LOG_WARN("%s: %zu of %zu ring entries unreadable in %s\n", __func__, missing, count, dir.c_str());
+    }
+    return total;
+}
+
 // spill one checkpoint's blob to disk as a single-checkpoint slot-file;
 // the entry keeps positions and an empty data vector afterwards.
 static std::string ckpt_spill_path(int slot_id, const server_prompt_checkpoint & ckpt, const std::string & dir) {
@@ -3122,7 +3347,8 @@ void server_context::process_single_task(server_task&& task) {
         std::string filepath = task.data.at("filepath");
         save_server_tokens_to_file(filepath+".tokens.json", slot->cache_tokens);
         create_checkpoint(*slot);
-        size_t saved = save_checkpoints_to_file(filepath + ".checkpoints", slot->server_cached_prompt.checkpoints);
+        size_t saved = save_checkpoints_ring(filepath + ".checkpoints", slot->server_cached_prompt.checkpoints,
+            slot->cache_tokens.data(), slot->cache_tokens.size());
 
         const size_t nwrite = llama_state_seq_save_file(ctx, filepath.c_str(), slot->id, slot->cache_tokens.data(), token_count);
 
@@ -3171,7 +3397,7 @@ void server_context::process_single_task(server_task&& task) {
             break;
         }
         load_server_tokens_from_file(filepath+".tokens.json", slot->cache_tokens);
-        size_t loaded = load_checkpoints_from_file(filepath + ".checkpoints", slot->server_cached_prompt.checkpoints);
+        size_t loaded = load_checkpoints_ring(filepath + ".checkpoints", slot->server_cached_prompt.checkpoints);
 
         const int64_t t_end = ggml_time_us();
         const double t_restore_ms = (t_end - t_start) / 1000.0;
