@@ -3814,13 +3814,17 @@ void server_context::apply_checkpoint(server_slot & slot) {
                     if (cur.pos_max > pos_next) {
                         return false;
                     }
+                    if (cur.pos_max < pos_min_thold && cur.pos_min != 0) {
+                        return false;
+                    }
                     return cur.pos_min < pos_min_thold || cur.pos_min == 0;
                 }
             );
 
-            bool do_reset = it == slot.server_cached_prompt.checkpoints.rend();
+            const bool no_checkpoint = it == slot.server_cached_prompt.checkpoints.rend();
+            bool do_reset = false;
 
-            if (!do_reset && it->data.empty()) {
+            if (!no_checkpoint && it->data.empty()) {
                 // spilled entry: reload from disk, else fall back to full reprocessing
                 const int64_t t_load = ggml_time_us();
                 if (!load_spilled_checkpoint(*it)) {
@@ -3831,7 +3835,7 @@ void server_context::apply_checkpoint(server_slot & slot) {
                 }
             }
 
-            if (!do_reset) {
+            if (!do_reset && !no_checkpoint) {
                 // restore the context checkpoint
                 const int64_t t_start = ggml_time_us();
                 const size_t checkpoint_size = it->data.size();
@@ -4008,7 +4012,7 @@ static void enforce_checkpoint_memory(server_slot & slot, int cap_total, int ram
 }
 
 bool server_context::create_checkpoint(server_slot & slot, bool prompt_end) {
-    bool do_checkpoint = !slot.image_just_processed;
+    bool do_checkpoint = true;
     int32_t pos_min = llama_kv_cache_seq_pos_min(slot.ctx, slot.id);
     const auto pos_max = llama_kv_cache_seq_pos_max(slot.ctx, slot.id);
 
@@ -4324,8 +4328,9 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                     };
                     mtmd_helper_eval_batch_callback mtp_media_callback =
                         mtp_media_warmup.slot ? server_mtp_media_warmup_callback : nullptr;
+                    const size_t n_skip = slot.n_past_prompt - slot.prompt_tokens.chunk_start(slot.n_past_prompt);
                     int32_t res = slot.prompt_tokens.process_chunk(
-                            ctx, mctx, slot.n_past_prompt, p1, slot.id, n_tokens_out,
+                            ctx, mctx, slot.n_past_prompt, n_skip, p1, slot.id, n_tokens_out,
                             mtp_media_callback, &mtp_media_warmup);
                     if (res != 0) {
                         LLAMA_LOG_ERROR("failed to process image, res = %d\n", res);

@@ -405,6 +405,8 @@ public:
 
     const mtmd::input_chunk_ptr& find_chunk(size_t idx) const;
 
+    size_t chunk_start(size_t idx) const;
+
     // Manual free for the raw audio (PCM) or imagebuffers (RGB-f32 (!)) of a multimedia chunk.
     // This data will never be read again after encoding on the first turn that multimedia are received.
     void free_raw_media_data(size_t idx);
@@ -473,6 +475,7 @@ public:
         llama_context* ctx,
         mtmd_context* mctx,
         size_t idx,
+        size_t n_skip,
         llama_pos pos,
         int32_t seq_id,
         size_t& n_tokens_out,

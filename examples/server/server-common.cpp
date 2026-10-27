@@ -1261,6 +1261,17 @@ std::string server_tokens::str() const {
     return oss.str();
 }
 
+size_t server_tokens::chunk_start(size_t idx) const {
+    auto it = map_idx_to_media.upper_bound(idx);
+    if (it == map_idx_to_media.begin()) {
+        return idx;
+    }
+    --it;
+    const size_t start = it->first;
+    const size_t n = mtmd_input_chunk_get_n_tokens(it->second.get());
+    return idx < start + n ? start : idx;
+}
+
 const mtmd::input_chunk_ptr& server_tokens::find_chunk(size_t idx) const {
     auto it = map_idx_to_media.find(idx);
     if (it != map_idx_to_media.end()) {
@@ -1702,6 +1713,7 @@ int32_t server_tokens::process_chunk(
     llama_context* ctx,
     mtmd_context* mctx,
     size_t idx,
+    size_t n_skip,
     llama_pos pos,
     int32_t seq_id,
     size_t& n_tokens_out,
@@ -1720,6 +1732,7 @@ int32_t server_tokens::process_chunk(
         seq_id,
         n_batch,
         true, // logits last
+        (int32_t) n_skip,
         &new_n_past,
         callback,
         callback_user_data);
@@ -1729,7 +1742,7 @@ int32_t server_tokens::process_chunk(
         n_tokens_out = 0;
         return result;
     }
-    n_tokens_out = mtmd_input_chunk_get_n_tokens(chunk.get());
+    n_tokens_out = mtmd_input_chunk_get_n_tokens(chunk.get()) - n_skip;
     return 0;
 }
 

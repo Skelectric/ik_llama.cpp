@@ -175,6 +175,7 @@ static int32_t mtmd_helper_decode_image_chunk_impl(
         llama_pos n_past,
         llama_seq_id seq_id,
         int32_t n_batch,
+        int32_t n_skip,
         llama_pos * new_n_past,
         mtmd_helper_eval_batch_callback callback,
         void * callback_user_data) {
@@ -190,8 +191,16 @@ static int32_t mtmd_helper_decode_image_chunk_impl(
     int n_pos_per_embd = mtmd_decode_use_mrope(ctx) ? 4 : 1;
 
     int32_t n_tokens = mtmd_input_chunk_get_n_tokens(chunk);
+    if (n_skip < 0 || n_skip >= n_tokens) {
+        LOG_ERR("failed to decode chunk: invalid skip %d of %d tokens\n", n_skip, n_tokens);
+        return -1;
+    }
+    if (n_skip > 0 && mtmd_decode_use_mrope(ctx)) {
+        LOG_ERR("failed to decode chunk: partial eval is not supported with M-RoPE\n");
+        return -1;
+    }
     int32_t i_batch = 0;
-    int32_t n_img_batches = (n_tokens + n_batch - 1) / n_batch;
+    int32_t n_img_batches = (n_tokens - n_skip + n_batch - 1) / n_batch;
     decode_embd_batch batch_embd(encoded_embd, n_tokens, n_pos_per_embd, n_mmproj_embd);
 
     if (mtmd_decode_use_mrope(ctx)) {
@@ -219,7 +228,7 @@ static int32_t mtmd_helper_decode_image_chunk_impl(
     }
 
     while (i_batch < n_img_batches) { // split into batches
-        int pos_offset = i_batch*n_batch;
+        int pos_offset = n_skip + i_batch*n_batch;
         int n_tokens_batch = std::min(n_batch, n_tokens - pos_offset);
         llama_batch batch_embd_view = batch_embd.get_view(pos_offset, n_tokens_batch);
 
@@ -247,7 +256,7 @@ static int32_t mtmd_helper_decode_image_chunk_impl(
         i_batch++;
     }
 
-    n_past += mtmd_input_chunk_get_n_pos(chunk);
+    n_past += mtmd_input_chunk_get_n_pos(chunk) - n_skip;
     *new_n_past = n_past;
 
     if (mtmd_decode_use_non_causal(ctx)) {
@@ -267,7 +276,7 @@ int32_t mtmd_helper_decode_image_chunk(
         int32_t n_batch,
         llama_pos * new_n_past) {
     return mtmd_helper_decode_image_chunk_impl(
-            ctx, lctx, chunk, encoded_embd, n_past, seq_id, n_batch, new_n_past, nullptr, nullptr);
+            ctx, lctx, chunk, encoded_embd, n_past, seq_id, n_batch, 0, new_n_past, nullptr, nullptr);
 }
 
 int32_t mtmd_helper_eval_chunk_single(mtmd_context * ctx,
@@ -279,7 +288,7 @@ int32_t mtmd_helper_eval_chunk_single(mtmd_context * ctx,
         bool logits_last,
         llama_pos * new_n_past) {
     return mtmd_helper_eval_chunk_single_with_callback(
-            ctx, lctx, chunk, n_past, seq_id, n_batch, logits_last, new_n_past, nullptr, nullptr);
+            ctx, lctx, chunk, n_past, seq_id, n_batch, logits_last, 0, new_n_past, nullptr, nullptr);
 }
 
 int32_t mtmd_helper_eval_chunk_single_with_callback(mtmd_context * ctx,
@@ -289,6 +298,7 @@ int32_t mtmd_helper_eval_chunk_single_with_callback(mtmd_context * ctx,
         llama_seq_id seq_id,
         int32_t n_batch,
         bool logits_last,
+        int32_t n_skip,
         llama_pos * new_n_past,
         mtmd_helper_eval_batch_callback callback,
         void * callback_user_data) {
@@ -351,7 +361,7 @@ int32_t mtmd_helper_eval_chunk_single_with_callback(mtmd_context * ctx,
 
         float * embd = mtmd_get_output_embd(ctx);
         ret = mtmd_helper_decode_image_chunk_impl(
-                ctx, lctx, chunk, embd, n_past, seq_id, n_batch, new_n_past, callback, callback_user_data);
+                ctx, lctx, chunk, embd, n_past, seq_id, n_batch, n_skip, new_n_past, callback, callback_user_data);
         if (ret != 0) {
             LOG_ERR("failed to decode %s\n", name);
             llama_batch_free(text_batch);

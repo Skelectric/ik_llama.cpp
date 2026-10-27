@@ -79,6 +79,7 @@ MTMD_API int32_t mtmd_helper_eval_chunk_single_with_callback(mtmd_context * ctx,
                                                              llama_seq_id seq_id,
                                                              int32_t n_batch,
                                                              bool logits_last,
+                                                             int32_t n_skip,
                                                              llama_pos * new_n_past,
                                                              mtmd_helper_eval_batch_callback callback,
                                                              void * callback_user_data);
