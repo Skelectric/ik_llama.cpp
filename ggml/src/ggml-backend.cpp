@@ -920,6 +920,8 @@ GGML_CALL static bool ggml_backend_cpu_supports_op(ggml_backend_t backend, const
 #else
             return false;
 #endif
+        case GGML_OP_INDEXER_BLOCK_TOPK:
+            return true;
         case GGML_OP_LATENT_ATTN:
             // Scalar reference forward exists and is dispatched, so support is truthful.
             // Whether to ADOPT the op on a CPU-resident layer is performance policy, and

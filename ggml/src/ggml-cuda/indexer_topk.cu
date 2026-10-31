@@ -379,14 +379,29 @@ static void indexer_select_top_k(ggml_backend_cuda_context & ctx, const float * 
     CUDA_CHECK(cudaGetLastError());
 }
 
-void ggml_cuda_op_indexer_topk(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+static __global__ void k_indexer_block_max(const float * __restrict__ score, const float * __restrict__ pin,
+        float * __restrict__ block_score, int n_kv, int n_b, int blk, size_t npb) {
+    const int row = blockIdx.x;
+    const int b   = blockIdx.y*blockDim.x + threadIdx.x;
+    if (b >= n_b) {
+        return;
+    }
+    const float * s = score + (size_t)row*n_kv + (size_t)b*blk;
+    float mx = -INFINITY;
+    for (int i = 0; i < blk; ++i) {
+        mx = fmaxf(mx, s[i]);
+    }
+    block_score[(size_t)row*n_b + b] = mx + pin[(size_t)row*npb + b];
+}
+
+static void indexer_topk_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst, bool block_mode) {
     auto op = ggml_unary_op(dst->op_params[0]);
     GGML_ASSERT(op == GGML_UNARY_OP_RELU);
     auto k = dst->src[0];
     auto q = dst->src[1];
     auto w = dst->src[2];
     auto m = dst->src[3];
-    auto c = dst->src[4];
+    auto c = block_mode ? nullptr : dst->src[4];
     int n_top_k = dst->ne[0];
     int n_kv    = m->type != GGML_TYPE_I32 ? m->ne[0] : c ? c->ne[0] : k->ne[1];
     int n_head  = q->ne[1];
@@ -414,6 +429,31 @@ void ggml_cuda_op_indexer_topk(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     GGML_ASSERT(ggml_is_contiguous(w));
 
     constexpr int k_block_size = 256;
+
+    const int blk_size = block_mode ? (int) dst->op_params[1] : 0;
+    const int n_b      = block_mode ? n_kv/blk_size : 0;
+    ggml_tensor * cand_pin = block_mode ? dst->src[4] : nullptr;
+    if (block_mode) {
+        GGML_ASSERT(blk_size > 0 && n_kv % blk_size == 0);
+        GGML_ASSERT(cand_pin != nullptr && cand_pin->type == GGML_TYPE_F32);
+        GGML_ASSERT(cand_pin->ne[0] == n_b && cand_pin->ne[1] == q->ne[2]);
+        GGML_ASSERT(dst->ne[0] <= n_b);
+    }
+    auto finish_rows = [&](const float * score, int * sorted, int nrows, int first_row) {
+        int * out = (int *)((char *)dst->data + first_row*dst->nb[1]);
+        if (!block_mode) {
+            indexer_select_top_k(ctx, score, sorted, out, n_kv, nrows, dst->ne[0]);
+            return;
+        }
+        ggml_cuda_pool_alloc<float> block_score(ctx.pool(), int64_t(n_b)*nrows);
+        const size_t npb = cand_pin->nb[1]/sizeof(float);
+        dim3 grid(nrows, (n_b + k_block_size - 1)/k_block_size, 1);
+        k_indexer_block_max<<<grid, k_block_size, 0, ctx.stream()>>>(score,
+                (const float *)cand_pin->data + (size_t)first_row*npb,
+                block_score.get(), n_kv, n_b, blk_size, npb);
+        CUDA_CHECK(cudaGetLastError());
+        indexer_select_top_k(ctx, block_score.get(), sorted, out, n_b, nrows, dst->ne[0]);
+    };
 
     if ((k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q8_0) && q->type == GGML_TYPE_F32) {
         const bool use_mma = new_mma_available(ggml_cuda_info().devices[ctx.device].cc) && q->ne[0] == 128 && q->ne[1] <= 64 && !c;
@@ -470,8 +510,7 @@ void ggml_cuda_op_indexer_topk(ggml_backend_cuda_context & ctx, ggml_tensor * ds
                 } else {
                     indexer_score_cuda(q_data, k, w_data, (const half  *)m_data, score.get(), m->nb[1], n_kv, nrows, q->ne[1], ctx.stream());
                 }
-                indexer_select_top_k(ctx, score.get(), sorted.get(), (int *)((char *)dst->data + first_row*dst->nb[1]),
-                        n_kv, nrows, dst->ne[0]);
+                finish_rows(score.get(), sorted.get(), nrows, first_row);
                 continue;
             }
 
@@ -528,8 +567,7 @@ void ggml_cuda_op_indexer_topk(ggml_backend_cuda_context & ctx, ggml_tensor * ds
                 CUDA_CHECK(cudaGetLastError());
             }
 
-            indexer_select_top_k(ctx, score.get(), sorted.get(), (int *)((char *)dst->data + first_row*dst->nb[1]),
-                    n_kv, nrows, dst->ne[0]);
+            finish_rows(score.get(), sorted.get(), nrows, first_row);
         }
 
         return;
@@ -605,10 +643,17 @@ void ggml_cuda_op_indexer_topk(ggml_backend_cuda_context & ctx, ggml_tensor * ds
         }
         CUDA_CHECK(cudaGetLastError());
 
-        indexer_select_top_k(ctx, score.get(), sorted.get(), (int *)((char *)dst->data + first*dst->nb[1]),
-                k->ne[1], nrows, dst->ne[0]);
+        finish_rows(score.get(), sorted.get(), nrows, first);
     }
 
+}
+
+void ggml_cuda_op_indexer_topk(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    indexer_topk_impl(ctx, dst, false);
+}
+
+void ggml_cuda_op_indexer_block_topk(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    indexer_topk_impl(ctx, dst, true);
 }
 
 template <typename mask_t>

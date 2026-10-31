@@ -4706,6 +4706,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "FUSED_RMS_RMS_ADD",
     "BLEND",
     "INDEXER_TOPK",
+    "INDEXER_BLOCK_TOPK",
     "MASK_TOPK",
     "SINKHORN",
     "HC_PRE",
@@ -4716,7 +4717,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "FMA",
 };
 
-static_assert(GGML_OP_COUNT == 112, "GGML_OP_COUNT != 112");
+static_assert(GGML_OP_COUNT == 113, "GGML_OP_COUNT != 113");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -4836,6 +4837,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "rms(x1)+rms(x2)",
     "blend(a,b,c)",
     "indexer_topk(k, q, w, mask)",
+    "indexer_block_topk(k, q, w, mask, pin)",
     "mask_topk(mask, topk)",
     "sinkhorn(x)",
     "hc_pre(x,s,b)",
@@ -4847,7 +4849,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
 };
 
-static_assert(GGML_OP_COUNT == 112, "GGML_OP_COUNT != 112");
+static_assert(GGML_OP_COUNT == 113, "GGML_OP_COUNT != 113");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -10718,6 +10720,42 @@ struct ggml_tensor * ggml_indexer_topk(
     return result;
 }
 
+
+struct ggml_tensor * ggml_indexer_block_topk(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * cand_pin,
+            enum ggml_unary_op    op,
+            int                   n_top_blocks,
+            int                   blk_size) {
+    GGML_ASSERT(k->ne[2] == 1 && k->ne[3] == 1);
+    GGML_ASSERT(k->ne[0] == q->ne[0]);
+    GGML_ASSERT(blk_size > 0 && k->ne[1] % blk_size == 0);
+    GGML_ASSERT(mask->type == GGML_TYPE_I32 ? mask->ne[0] == 1 : k->ne[1] == mask->ne[0]);
+    GGML_ASSERT(cand_pin != NULL);
+    GGML_ASSERT(cand_pin->type == GGML_TYPE_F32);
+    GGML_ASSERT(cand_pin->ne[0] == k->ne[1]/blk_size);
+    GGML_ASSERT(cand_pin->ne[1] == q->ne[2]);
+    GGML_ASSERT(n_top_blocks > 0 && n_top_blocks <= cand_pin->ne[0]);
+    GGML_ASSERT(q->ne[2] == mask->ne[1]);
+    GGML_ASSERT(q->ne[1] == w->ne[0]);
+    GGML_ASSERT(q->ne[2] == w->ne[1]);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_top_blocks, q->ne[2]);
+    result->op = GGML_OP_INDEXER_BLOCK_TOPK;
+    result->op_params[0] = (int)op;
+    result->op_params[1] = blk_size;
+    result->src[0] = k;
+    result->src[1] = q;
+    result->src[2] = w;
+    result->src[3] = mask;
+    result->src[4] = cand_pin;
+
+    return result;
+}
 
 struct ggml_tensor * ggml_sinkhorn(
             struct ggml_context * ctx,
@@ -25337,6 +25375,80 @@ static void ggml_compute_forward_hc_pre(
     }
 }
 
+typedef struct { float s; int i; } ggml_indexer_block_entry;
+
+static int ggml_indexer_block_entry_cmp(const void * a, const void * b) {
+    const ggml_indexer_block_entry * x = (const ggml_indexer_block_entry *) a;
+    const ggml_indexer_block_entry * y = (const ggml_indexer_block_entry *) b;
+    if (x->s != y->s) return x->s > y->s ? -1 : 1;
+    return x->i < y->i ? -1 : (x->i > y->i ? 1 : 0);
+}
+
+static void ggml_compute_forward_indexer_block_topk(const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    const struct ggml_tensor * k = dst->src[0];
+    const struct ggml_tensor * q = dst->src[1];
+    const struct ggml_tensor * w = dst->src[2];
+    const struct ggml_tensor * m = dst->src[3];
+    const struct ggml_tensor * pin = dst->src[4];
+
+    GGML_ASSERT((enum ggml_unary_op) dst->op_params[0] == GGML_UNARY_OP_RELU);
+
+    const int blk_size = (int) dst->op_params[1];
+    const int n_top    = (int) dst->ne[0];
+    const int n_kv     = (int) k->ne[1];
+    const int n_b      = n_kv/blk_size;
+    const int n_head   = (int) q->ne[1];
+    const int n_tok    = (int) q->ne[2];
+    const int ne0      = (int) k->ne[0];
+
+    const ggml_type_traits_t * tr = &type_traits[k->type];
+    GGML_ASSERT(tr->to_float != NULL);
+
+    const int npt   = (n_tok + params->nth - 1)/params->nth;
+    const int first = npt*params->ith;
+    const int last  = MIN(first + npt, n_tok);
+
+    float * krow = (float *) malloc(sizeof(float)*ne0);
+    float * bs   = (float *) malloc(sizeof(float)*n_b);
+    ggml_indexer_block_entry * ent = (ggml_indexer_block_entry *) malloc(sizeof(ggml_indexer_block_entry)*n_b);
+
+    for (int it = first; it < last; ++it) {
+        for (int b = 0; b < n_b; ++b) {
+            float best = -INFINITY;
+            for (int j = 0; j < blk_size; ++j) {
+                const int col = b*blk_size + j;
+                float sum;
+                if (m->type == GGML_TYPE_I32) {
+                    const int nvis = *(const int32_t *)((const char *)m->data + it*m->nb[1]);
+                    sum = col < nvis ? 0.0f : -INFINITY;
+                } else if (m->type == GGML_TYPE_F16) {
+                    sum = GGML_FP16_TO_FP32(*(const ggml_fp16_t *)((const char *)m->data + col*m->nb[0] + it*m->nb[1]));
+                } else {
+                    sum = *(const float *)((const char *)m->data + col*m->nb[0] + it*m->nb[1]);
+                }
+                if (sum > -INFINITY) {
+                    tr->to_float((const char *)k->data + col*k->nb[1], krow, 1);
+                    for (int h = 0; h < n_head; ++h) {
+                        const float * qh = (const float *)((const char *)q->data + h*q->nb[1] + it*q->nb[2]);
+                        float dot = 0.0f;
+                        for (int d = 0; d < ne0; ++d) dot += krow[d]*qh[d];
+                        if (dot > 0.0f) sum += dot*(*(const float *)((const char *)w->data + h*w->nb[0] + it*w->nb[1]));
+                    }
+                }
+                if (sum > best) best = sum;
+            }
+            bs[b] = best + *(const float *)((const char *)pin->data + b*pin->nb[0] + it*pin->nb[1]);
+            ent[b].s = bs[b]; ent[b].i = b;
+        }
+        qsort(ent, n_b, sizeof(ggml_indexer_block_entry), ggml_indexer_block_entry_cmp);
+        int * out = (int *)((char *)dst->data + it*dst->nb[1]);
+        for (int j = 0; j < n_top; ++j) out[j] = ent[j].i;
+    }
+
+    free(krow); free(bs); free(ent);
+}
+
 static void ggml_compute_forward_visible_mask(const struct ggml_compute_params * params,
         struct ggml_tensor * dst) {
     const struct ggml_tensor * vis = dst->src[0];
@@ -27711,6 +27823,10 @@ static int ggml_compute_forward(struct ggml_compute_params * params, struct ggml
                 if (!iqk_indexer_topk(tensor, params->wdata, (barrier_t)ggml_barrier, (void *)params->shared, params->ith, params->nth)) {
                     GGML_ABORT("Fatal error");
                 }
+            } break;
+        case GGML_OP_INDEXER_BLOCK_TOPK:
+            {
+                ggml_compute_forward_indexer_block_topk(params, tensor);
             } break;
         case GGML_OP_MASK_TOPK:
             {

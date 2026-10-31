@@ -722,6 +722,7 @@ extern "C" {
         GGML_OP_FUSED_RMS_RMS_ADD,
         GGML_OP_BLEND,
         GGML_OP_INDEXER_TOPK,
+        GGML_OP_INDEXER_BLOCK_TOPK,
         GGML_OP_MASK_TOPK,
         GGML_OP_SINKHORN,
         GGML_OP_HC_PRE,
@@ -2726,6 +2727,17 @@ extern "C" {
             struct ggml_tensor  * blk_idx,
             enum ggml_unary_op    op,
             int                   n_top_k);
+
+    GGML_API struct ggml_tensor * ggml_indexer_block_topk(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * cand_pin,
+            enum ggml_unary_op    op,
+            int                   n_top_blocks,
+            int                   blk_size);
 
     // Sinkhorn normalization of a flat [S*S, T] batch of S x S matrices into
     // doubly-stochastic form: softmax over columns, then column normalization,
